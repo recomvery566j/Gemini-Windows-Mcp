@@ -1715,6 +1715,45 @@
     planDivider.appendChild(btnStopPlan);
     wsBox.appendChild(planDivider);
 
+    // Gemini 官方配置入口：全局提示词、关联应用(MCP)与技能均在官方页面维护，避免脆性前端注入
+    const geminiLinksDivider = document.createElement('div');
+    Object.assign(geminiLinksDivider.style, {
+      borderTop: '1px solid #27272a',
+      paddingTop: '8px',
+      display: 'flex',
+      flexWrap: 'wrap',
+      alignItems: 'center',
+      gap: '6px',
+    });
+    const geminiLinksLbl = document.createElement('span');
+    geminiLinksLbl.textContent = 'Gemini 官方设置:';
+    Object.assign(geminiLinksLbl.style, { color: '#a1a1aa', fontSize: '11px', marginRight: '2px' });
+    geminiLinksDivider.appendChild(geminiLinksLbl);
+
+    const officialLinks = [
+      ['全局指令 (saved-info)', 'https://gemini.google.com/saved-info'],
+      ['关联应用 / MCP (connectors)', 'https://gemini.google.com/customize/connectors'],
+      ['技能 (skills)', 'https://gemini.google.com/customize/skills'],
+    ];
+    for (const [label, href] of officialLinks) {
+      const a = document.createElement('a');
+      a.textContent = label;
+      a.href = href;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      Object.assign(a.style, {
+        color: '#93c5fd',
+        fontSize: '11px',
+        textDecoration: 'none',
+        padding: '2px 7px',
+        borderRadius: '6px',
+        border: '1px solid #3f3f46',
+        background: '#18181b',
+      });
+      geminiLinksDivider.appendChild(a);
+    }
+    wsBox.appendChild(geminiLinksDivider);
+
     function renderTaskPlanInfo(plan) {
       currentTaskPlan = plan || null;
       if (!plan) {

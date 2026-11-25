@@ -307,6 +307,21 @@ class TestMcpCore(unittest.TestCase):
         self.assertEqual(state_after["tokens"], {})
         self.assertEqual(state_after["refresh_tokens"], {})
 
+        # Verify CLI --issue-token prints plaintext token + save prompt directly in terminal
+        import contextlib
+        import io
+        cli_cfg_path = self.root / "cli_issue_config.json"
+        cli_cfg_path.write_text(json.dumps(raw_cfg), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_issue = server_main(["--config", str(cli_cfg_path), "--issue-token", "--no-gui"])
+        self.assertEqual(rc_issue, 0)
+        cli_out = buf.getvalue()
+        issued_tok = json.loads(cli_cfg_path.read_text(encoding="utf-8"))["auth"]["token"]
+        self.assertTrue(issued_tok.startswith("pcmcp_"))
+        self.assertIn(f"鉴权 Token : {issued_tok}", cli_out)
+        self.assertIn("请立即复制并保存", cli_out)
+
     def test_first_run_workspace_selection_and_copy(self):
         fake_src = self.root / "fake_dist"
         fake_src.mkdir()
