@@ -1,4 +1,4 @@
-# pc-work-mcp · Windows 本机工作台 MCP 服务（分发版）
+# pc-work-mcp · Windows 本机工作台 MCP 服务（分发版）（略有小坑打磨中）
 
 一个纯粹、可自举的 Windows 本机工作台 MCP 服务：
 
