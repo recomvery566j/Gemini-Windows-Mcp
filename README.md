@@ -75,7 +75,8 @@ powershell -ExecutionPolicy Bypass -File ".\admin\add-firewall.ps1"
 python "<你的工作区路径>\server.py"
 ```
 
-连接 Google / Gemini 自定义 MCP 时，使用本地派发的 token 作为 Bearer Token 或 `/authorize` 授权页的访问口令。
+- **外网双栈 TCP 自检锁**：若配置了 `oauth.public_base_url`，服务在监听端口后会自动调用外部在线双栈探针（兼容纯 IPv6 宽带、IPv4 与中国大陆直连环境，不依赖 ICMP ping）检测外网能否连入该域名/端口；若外网确实不通，启动日志会直接报 `[自检锁拦截]` 并退出，避免白连 Google。若需跳过检查，可传 `--skip-tcp-check` 或在 `config.json` 将 `oauth.startup_tcp_check` 设为 `false`；也可单独运行 `python server.py --check-public-url` 随时自检。
+- 连接 Google / Gemini 自定义 MCP 时，使用本地派发的 token 作为 Bearer Token 或 `/authorize` 授权页的访问口令。
 
 ---
 

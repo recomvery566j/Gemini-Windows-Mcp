@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import fnmatch
 import hashlib
 import hmac
 import html
 import io
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -24,7 +26,9 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -92,6 +96,7 @@ DEFAULT_CONFIG = {
         "authorize_password": "",
         "access_token_ttl_sec": 28800,
         "refresh_token_ttl_sec": 2592000,
+        "startup_tcp_check": True,
     },
     "workspace": {
         "initialized": False,
@@ -496,6 +501,205 @@ def issue_local_token(config_path: Path, rotate: bool = False) -> dict:
         "token": new_token,
         "masked_token": mask_token(new_token),
         "config_path": str(config_path),
+    }
+
+
+def _is_private_or_loopback_host(host: str) -> bool:
+    h = (host or "").strip().strip("[]").lower()
+    if not h:
+        return True
+    if h in ("localhost", "ip6-localhost") or h.endswith((".local", ".lan", ".internal")):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+        return bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast)
+    except ValueError:
+        return False
+
+
+def _probe_edis_family(host: str, port: int, family: str, timeout_sec: float = 8.0) -> dict:
+    """使用 EDIS 双栈在线 TCP 探测接口检查单栈（IPv6 或 IPv4）外网端口可达性。"""
+    payload = json.dumps({"target": host, "port": int(port), "family": family}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://at.edisglobal.com/api/v1/port",
+        data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": f"{SERVER_NAME}/{SERVER_VERSION}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        st = str(data.get("status") or "").lower()
+        if st == "open":
+            return {
+                "state": "open",
+                "provider": "edisglobal",
+                "family": family,
+                "resolved": data.get("resolved"),
+                "connect_ms": data.get("connectTimeMs"),
+                "source": data.get("source"),
+            }
+        if st in ("closed", "timeout", "filtered", "unreachable"):
+            return {
+                "state": "timeout" if st == "timeout" else "closed",
+                "provider": "edisglobal",
+                "family": family,
+                "resolved": data.get("resolved"),
+                "detail": st,
+                "source": data.get("source"),
+            }
+        return {"state": "api_error", "provider": "edisglobal", "family": family, "detail": st or "unknown"}
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        if exc.code == 400 and ("family_unavailable" in body or "resolve" in body.lower() or "nxdomain" in body.lower()):
+            return {"state": "dns_missing", "provider": "edisglobal", "family": family, "detail": body.strip()}
+        return {"state": "api_error", "provider": "edisglobal", "family": family, "detail": f"HTTP {exc.code}: {body[:120]}"}
+    except Exception as exc:
+        return {"state": "api_error", "provider": "edisglobal", "family": family, "detail": str(exc)}
+
+
+def _probe_globalping_family(host: str, port: int, scheme: str, family: str, timeout_sec: float = 12.0) -> dict:
+    """备选 Globalping 全球多节点双栈探针（兼容中国大陆直连与 IPv6 AAAA）。"""
+    ip_ver = 6 if family == "6" else 4
+    proto = "HTTPS" if (scheme or "").lower() == "https" else "HTTP"
+    payload = json.dumps({
+        "type": "http",
+        "target": host,
+        "locations": [{"continent": "NA", "limit": 1}, {"continent": "EU", "limit": 1}, {"continent": "AS", "limit": 1}],
+        "measurementOptions": {
+            "protocol": proto,
+            "port": int(port),
+            "request": {"path": "/health", "method": "GET"},
+            "ipVersion": ip_ver,
+        },
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.globalping.io/v1/measurements",
+        data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": f"{SERVER_NAME}/{SERVER_VERSION}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=min(8.0, timeout_sec)) as resp:
+            meta = json.loads(resp.read().decode("utf-8"))
+        mid = meta.get("id")
+        if not mid:
+            return {"state": "api_error", "provider": "globalping", "family": family, "detail": "no measurement id"}
+    except Exception as exc:
+        return {"state": "api_error", "provider": "globalping", "family": family, "detail": str(exc)}
+
+    deadline = time.monotonic() + max(4.0, timeout_sec)
+    last_res = None
+    while time.monotonic() < deadline:
+        time.sleep(0.9)
+        try:
+            r2 = urllib.request.Request(
+                f"https://api.globalping.io/v1/measurements/{mid}",
+                headers={"User-Agent": f"{SERVER_NAME}/{SERVER_VERSION}"},
+            )
+            with urllib.request.urlopen(r2, timeout=6.0) as resp2:
+                last_res = json.loads(resp2.read().decode("utf-8"))
+            if last_res.get("status") != "in-progress":
+                break
+        except Exception as exc:
+            return {"state": "api_error", "provider": "globalping", "family": family, "detail": str(exc)}
+
+    results = (last_res or {}).get("results") or []
+    if not results:
+        return {"state": "api_error", "provider": "globalping", "family": family, "detail": "empty results"}
+
+    states: list[str] = []
+    details: list[str] = []
+    for item in results:
+        res_obj = item.get("result") or {}
+        code = res_obj.get("statusCode")
+        raw = str(res_obj.get("rawOutput") or "")
+        if isinstance(code, int) and code > 0:
+            return {"state": "open", "provider": "globalping", "family": family, "detail": f"HTTP {code}"}
+        upper = raw.upper()
+        # 自签名证书或 TLS 主机名告警说明 TCP 三次握手已经通了
+        if any(tok in upper for tok in ("SELF_SIGNED", "UNABLE_TO_VERIFY", "CERT_", "TLS", "SSL")):
+            if "ECONNREFUSED" not in upper and "ETIMEDOUT" not in upper:
+                return {"state": "open", "provider": "globalping", "family": family, "detail": "TCP+TLS reached"}
+        if "ENOTFOUND" in upper or "EAI_NONAME" in upper or "NO AAAA" in upper or "NO A RECORD" in upper:
+            states.append("dns_missing")
+        elif "ETIMEDOUT" in upper:
+            states.append("timeout")
+        elif "ECONNREFUSED" in upper or "EHOSTUNREACH" in upper or "ENETUNREACH" in upper:
+            states.append("closed")
+        else:
+            states.append("api_error")
+        if raw:
+            details.append(raw.strip().splitlines()[0][:100])
+
+    if "closed" in states:
+        return {"state": "closed", "provider": "globalping", "family": family, "detail": "; ".join(details[:2])}
+    if "timeout" in states:
+        return {"state": "timeout", "provider": "globalping", "family": family, "detail": "; ".join(details[:2])}
+    if states and all(s == "dns_missing" for s in states):
+        return {"state": "dns_missing", "provider": "globalping", "family": family, "detail": "; ".join(details[:2])}
+    return {"state": "api_error", "provider": "globalping", "family": family, "detail": "; ".join(details[:2]) or "inconclusive"}
+
+
+def verify_public_tcp_reachability(
+    public_base_url: str,
+    *,
+    probe_fn=None,
+    timeout_sec: float = 10.0,
+) -> dict:
+    """从外网在线探测双栈（IPv6 + IPv4）TCP 可达性，用于启动自检锁。"""
+    raw = str(public_base_url or "").strip()
+    if not raw:
+        return {"status": "skipped", "reason": "empty_url"}
+    parsed = urllib.parse.urlsplit(raw if "://" in raw else f"https://{raw}")
+    host = (parsed.hostname or "").strip()
+    if not host:
+        return {"status": "skipped", "reason": "invalid_url", "url": raw}
+    scheme = (parsed.scheme or "https").lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+
+    if _is_private_or_loopback_host(host):
+        return {"status": "skipped", "reason": "private_or_loopback_host", "host": host, "port": port}
+
+    def run_dual(fn):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            f6 = pool.submit(fn, host, port, "6")
+            f4 = pool.submit(fn, host, port, "4")
+            return {"ipv6": f6.result(), "ipv4": f4.result()}
+
+    if probe_fn is not None:
+        fam_res = run_dual(probe_fn)
+    else:
+        fam_res = run_dual(lambda h, p, fam: _probe_edis_family(h, p, fam, timeout_sec=min(8.0, timeout_sec)))
+        # 若主探针服务本身不可用，自动回退到 Globalping 多节点探测
+        if all((fam_res[k] or {}).get("state") == "api_error" for k in ("ipv6", "ipv4")):
+            fam_res = run_dual(lambda h, p, fam: _probe_globalping_family(h, p, scheme, fam, timeout_sec=timeout_sec))
+
+    s6 = str((fam_res["ipv6"] or {}).get("state") or "api_error")
+    s4 = str((fam_res["ipv4"] or {}).get("state") or "api_error")
+    open_families = [name for name, st in (("IPv6", s6), ("IPv4", s4)) if st == "open"]
+    if open_families:
+        return {
+            "status": "reachable",
+            "host": host,
+            "port": port,
+            "reachable_families": open_families,
+            "families": fam_res,
+        }
+    if s6 in ("closed", "timeout") or s4 in ("closed", "timeout") or (s6 == "dns_missing" and s4 == "dns_missing"):
+        return {
+            "status": "unreachable",
+            "host": host,
+            "port": port,
+            "reachable_families": [],
+            "families": fam_res,
+        }
+    return {
+        "status": "unavailable",
+        "host": host,
+        "port": port,
+        "reachable_families": [],
+        "families": fam_res,
     }
 
 
@@ -3429,11 +3633,13 @@ def main(argv=None):
     parser.add_argument("--issue-token", action="store_true", help="在本地派发并保存鉴权 token（连接 Google 服务前必须执行）")
     parser.add_argument("--rotate-token", action="store_true", help="重新派发新的鉴权 token 并作废旧 OAuth 会话")
     parser.add_argument("--token-status", action="store_true", help="查看当前本地鉴权 token 配置状态")
+    parser.add_argument("--check-public-url", nargs="?", const="", default=None, help="手动从外网双栈 TCP 探测公网入口是否可达（默认读取 config.json 的 oauth.public_base_url）")
+    parser.add_argument("--skip-tcp-check", action="store_true", help="启动时跳过外网公网地址双栈 TCP 自检锁")
     parser.add_argument("--dry-run", action="store_true", help="打印配置后退出")
     args = parser.parse_args(argv)
 
     cfg_path = Path(args.config)
-    if not args.dry_run and not args.token_status:
+    if not args.dry_run and not args.token_status and args.check_public_url is None:
         ws_init = ensure_first_run_workspace(
             cfg_path,
             requested_workspace=args.workspace,
@@ -3514,6 +3720,12 @@ def main(argv=None):
         }, ensure_ascii=False, indent=2))
         return 0
 
+    if args.check_public_url is not None:
+        target_url = (args.check_public_url or "").strip() or str((cfg.get("oauth") or {}).get("public_base_url") or "").strip()
+        chk = verify_public_tcp_reachability(target_url)
+        print(json.dumps(chk, ensure_ascii=False, indent=2))
+        return 2 if chk.get("status") == "unreachable" else 0
+
     setup_logging(cfg)
     LOG.info("starting %s %s (config=%s)", SERVER_NAME, SERVER_VERSION, args.config)
 
@@ -3553,11 +3765,53 @@ def main(argv=None):
             pass
 
     LOG.info("MCP endpoint: http://%s:%s/mcp", host, port)
+    srv_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.5}, daemon=True)
+    srv_thread.start()
+
+    oauth_cfg = cfg.get("oauth") or {}
+    pub_url = str(oauth_cfg.get("public_base_url") or "").strip()
+    if oauth_cfg.get("enabled", True) and pub_url and oauth_cfg.get("startup_tcp_check", True) and not args.skip_tcp_check:
+        LOG.info("正在执行公网入口外网双栈 TCP 自检: %s", pub_url)
+        chk = verify_public_tcp_reachability(pub_url)
+        fam = chk.get("families") or {}
+        v6_st = (fam.get("ipv6") or {}).get("state", "-")
+        v4_st = (fam.get("ipv4") or {}).get("state", "-")
+        st = chk.get("status")
+        if st == "reachable":
+            LOG.info(
+                "[外网自检通过] %s:%s 外网 TCP 可达 (可达栈=%s | IPv6=%s | IPv4=%s)",
+                chk.get("host"), chk.get("port"), "/".join(chk.get("reachable_families") or []), v6_st, v4_st,
+            )
+        elif st == "skipped":
+            LOG.info("[外网自检跳过] %s (%s)", pub_url, chk.get("reason"))
+        elif st == "unavailable":
+            LOG.warning(
+                "[外网自检提示] 外部在线 TCP 探测服务暂不可用，无法确认 %s:%s 外网连通性 (IPv6=%s | IPv4=%s)；"
+                "已放行启动，请自行确认反代与防火墙。",
+                chk.get("host"), chk.get("port"), v6_st, v4_st,
+            )
+        else:
+            LOG.error(
+                "[自检锁拦截] 外部在线双栈 TCP 探测显示 %s:%s 无法从外网连通 (IPv6=%s | IPv4=%s)！\n"
+                "  此时即使启动服务，Google 也无法连入本机。\n"
+                "  请逐项检查：\n"
+                "  1) Windows 防火墙是否已以管理员运行 admin\\add-firewall.ps1 放行端口；\n"
+                "  2) 路由器端口转发 / lucky 反向代理 / 内网穿透是否开启，且已监听当前最新 IPv6 前缀/域名；\n"
+                "  3) oauth.public_base_url 的域名和端口号是否拼写正确。\n"
+                "  （若确认只需本机/局域网访问或临时跳过自检，可加 --skip-tcp-check 启动，或在 config.json 将 oauth.startup_tcp_check 设为 false。）",
+                chk.get("host"), chk.get("port"), v6_st, v4_st,
+            )
+            server.shutdown()
+            server.server_close()
+            return 2
+
     LOG.info(PER_CONVERSATION_GUIDE_NOTICE)
     try:
-        server.serve_forever(poll_interval=0.5)
+        while srv_thread.is_alive():
+            srv_thread.join(timeout=0.5)
     except KeyboardInterrupt:
         LOG.info("KeyboardInterrupt, shutting down")
+        server.shutdown()
     finally:
         server.server_close()
         LOG.info("stopped")

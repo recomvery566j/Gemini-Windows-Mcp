@@ -32,6 +32,7 @@ from server import (  # noqa: E402
     is_local_token_configured,
     issue_local_token,
     main as server_main,
+    verify_public_tcp_reachability,
 )
 from snapshot import SnapshotManager  # noqa: E402
 
@@ -1518,6 +1519,55 @@ class TestMcpCore(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_startup_dual_stack_tcp_self_check_lock(self):
+        # 1) Loopback / RFC1918 / non-global addresses are cleanly skipped; public domain runs probe
+        self.assertEqual(verify_public_tcp_reachability("https://127.0.0.1:15672")["status"], "skipped")
+        self.assertEqual(verify_public_tcp_reachability("https://192.0.2.10:15672")["status"], "skipped")
+        self.assertEqual(verify_public_tcp_reachability("https://pub.example.com:15672", probe_fn=lambda h, p, fam: {"state": "open"})["status"], "reachable")
+
+        # 2) China broadband IPv6-only scenario: IPv4 dns_missing/timeout while IPv6 open -> reachable!
+        def v6_only_probe(host, port, fam):
+            if fam == "6":
+                return {"state": "open", "provider": "mock", "family": "6"}
+            return {"state": "dns_missing", "provider": "mock", "family": "4"}
+
+        res_v6 = verify_public_tcp_reachability("https://ddns.example.com:14769", probe_fn=v6_only_probe)
+        self.assertEqual(res_v6["status"], "reachable")
+        self.assertEqual(res_v6["reachable_families"], ["IPv6"])
+
+        # 3) External probe API outage -> unavailable (does not brick startup)
+        res_api_down = verify_public_tcp_reachability(
+            "https://ddns.example.com:14769",
+            probe_fn=lambda h, p, fam: {"state": "api_error", "provider": "mock", "family": fam},
+        )
+        self.assertEqual(res_api_down["status"], "unavailable")
+
+        # 4) Both IPv6 and IPv4 unreachable -> self-check lock aborts server_main with exit code 2
+        from unittest.mock import patch
+        cfg_path = self.root / "lock_cfg.json"
+        lock_cfg = deep_merge(DEFAULT_CONFIG, {
+            "auth": {"enabled": True, "token": "pcmcp_lock_test_tok"},
+            "listen": {"host": "127.0.0.1", "port": 0},
+            "oauth": {"enabled": True, "public_base_url": "https://dead.example.com:14769", "startup_tcp_check": True},
+            "workspace": {"initialized": True, "default_dir": str(self.ws)},
+            "exec": {"workdir": str(self.ws)},
+            "push": {"outbox_dir": str(self.root / "outbox")},
+            "log": {"file": str(self.root / "logs" / "lock.log")},
+        })
+        cfg_path.write_text(json.dumps(lock_cfg), encoding="utf-8")
+
+        with patch("server.verify_public_tcp_reachability", return_value={
+            "status": "unreachable",
+            "host": "dead.example.com",
+            "port": 14769,
+            "reachable_families": [],
+            "families": {"ipv6": {"state": "closed"}, "ipv4": {"state": "dns_missing"}},
+        }):
+            rc_locked = server_main(["--config", str(cfg_path)])
+            self.assertEqual(rc_locked, 2)
+            rc_cli_chk = server_main(["--config", str(cfg_path), "--check-public-url"])
+            self.assertEqual(rc_cli_chk, 2)
 
 
 if __name__ == "__main__":
