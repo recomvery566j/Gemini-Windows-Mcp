@@ -1,0 +1,93 @@
+{
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 15672,
+    "bind_retry_sec": 120
+  },
+  "auth": {
+    "enabled": true,
+    "token": "",
+    "health_requires_auth": false
+  },
+  "workspace": {
+    "initialized": false,
+    "default_dir": "",
+    "extra_allowed_dirs": [],
+    "blocked_read_prefixes": [
+      "C:\\Windows\\System32",
+      "%LOCALAPPDATA%\\Google\\Chrome\\User Data"
+    ],
+    "popup_approval": {
+      "enabled": true,
+      "timeout_sec": 45,
+      "allow_session_trust": true
+    },
+    "snapshot": {
+      "enabled": true,
+      "max_versions_per_file": 20
+    }
+  },
+  "exec": {
+    "sync_timeout_sec": 60,
+    "max_sync_timeout_sec": 180,
+    "max_inline_chars": 16000,
+    "max_concurrency": 4,
+    "workdir": "",
+    "powershell_exe": "",
+    "python_exe": "",
+    "bash_exe": ""
+  },
+  "vision": {
+    "max_dimension": 1600,
+    "jpeg_quality": 85,
+    "max_image_bytes": 4194304,
+    "canary_pixel": true
+  },
+  "push": {
+    "outbox_dir": "",
+    "url_ttl_sec": 86400
+  },
+  "permissions": {
+    "per_conversation_enabled": true,
+    "new_conversation_default_profile": "ask",
+    "ambiguous_window_policy": "ask",
+    "approval_timeout_sec": 45,
+    "store_file": ""
+  },
+  "workspace_rules": {
+    "enabled": true,
+    "reinject_every_calls": 20,
+    "reinject_every_output_chars": 48000,
+    "max_total_chars": 24000,
+    "patterns": [
+      "AGENTS.md",
+      "GEMINI.md",
+      ".gemini/AGENTS.md",
+      ".gemini/GEMINI.md",
+      ".gemini/rules/*.md"
+    ]
+  },
+  "post_edit_checks": {
+    "syntax_check": true,
+    "on_edit_commands": [],
+    "command_timeout_sec": 15,
+    "allow_workspace_checks_file": true
+  },
+  "task_plan": {
+    "default_max_auto_turns": 5,
+    "max_allowed_auto_turns": 10,
+    "min_cooldown_sec": 5,
+    "max_handoff_chars": 220
+  },
+  "log": {
+    "file": "",
+    "level": "INFO"
+  },
+  "oauth": {
+    "enabled": true,
+    "public_base_url": "",
+    "authorize_password": "",
+    "access_token_ttl_sec": 28800,
+    "refresh_token_ttl_sec": 2592000
+  }
+}
