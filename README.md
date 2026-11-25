@@ -45,7 +45,7 @@ python server.py --issue-token --public-url "https://你的公网域名:端口"
 
 该命令会按顺序完成两件事：
 1. **选择并初始化工作区**：弹出 Windows 文件夹选择框（也可用 `--workspace "D:\MyWorkspace"` 指定，或 `--no-gui` 走命令行输入）；若取消/留空或非交互运行，则在**当前用户桌面**创建 `pc-work-mcp-workspace`，并把全部源码、配置、文档与测试一次性复制到工作区内。
-2. **派发本地鉴权 Token**：生成高强度随机 token（`pcmcp_...`），同步写入源目录与工作区内的 `config.json`。
+2. **派发本地鉴权 Token**：生成高强度随机 token（`pcmcp_...`），同步写入源目录与工作区内的 `config.json`，并在命令行明文打印该 Token 与保存提示（请立即复制保存）。
 
 常用辅助命令：
 - 查看当前 token 状态（脱敏）：`python server.py --token-status`

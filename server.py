@@ -3476,6 +3476,13 @@ def main(argv=None):
             cfg_now = load_config(str(cfg_path))
             ws_dir = str((cfg_now.get("workspace") or {}).get("default_dir") or HERE)
             port_now = int((cfg_now.get("listen") or {}).get("port") or 15672)
+            ws_cfg_path = Path(ws_dir) / "config.json"
+            print("\n" + "=" * 72)
+            print("【请立即复制并保存你的本地鉴权 Token（仅首次生成/轮换时明文打印）】")
+            print(f"  鉴权 Token : {res['token']}")
+            print(f"  同步已写入 : {ws_cfg_path}")
+            print("  保存提示   : 连接 Google OAuth 授权页、Bearer 鉴权与油猴脚本都需要使用该 Token，请妥善保存切勿泄露。")
+            print("=" * 72)
             print("\n已在本地派发鉴权 token。下一步：")
             print(f"1. 从工作区启动服务：python \"{Path(ws_dir) / 'server.py'}\"")
             print("2. 连接 Google / Gemini MCP 时，将该 token 作为 Bearer Token 或 OAuth 授权页口令。")
@@ -3486,6 +3493,7 @@ def main(argv=None):
             print("   （授权规则基于各自会话链接，由本地桥直接掌控，不由会话内 Agent 或 Google 掌管。）")
         else:
             print("\n已存在本地鉴权 token；如需轮换并作废旧会话，请加 --rotate-token。")
+            print("（如忘记完整 token，可打开工作区 config.json 查看 auth.token 字段，或运行 --rotate-token 重新生成。）")
         return 0
 
     cfg = load_config(args.config)
