@@ -53,7 +53,21 @@ python server.py --issue-token --public-url "https://你的公网域名:端口"
 
 > 若未先派发本地 token 直接运行 `server.py`，服务会拒绝启动（退出码 `2`），且 `/register`、`/authorize`、`/token` 等 OAuth 端点会返回 `403 local_token_not_issued`。
 
-### 第二步：启动服务并连接
+### 第二步：放行 Windows 入站防火墙（跨主机反代/局域网访问必做）
+
+如果你的反向代理或内网穿透（如路由器/NAS/另一台主机上的 `lucky`、`nginx`、`caddy`、`frp`）需要从本机以外访问 Windows 的监听端口（默认 `15672`），**连接前必须先以管理员身份运行 PowerShell 放行入站规则**，否则 Windows 防火墙会直接丢弃入站流量：
+
+```powershell
+# 以管理员身份打开 PowerShell，在项目或工作区目录执行（默认放行同网段 LocalSubnet 到 TCP 15672）
+powershell -ExecutionPolicy Bypass -File ".\admin\add-firewall.ps1"
+
+# 如自定义端口或反代来自特定 IP / 跨网段 / 虚拟组网，可按需传参：
+# powershell -ExecutionPolicy Bypass -File ".\admin\add-firewall.ps1" -Port 15672 -RemoteAddress "<反代主机IP>"
+```
+
+（默认规则作用于 `Private,Domain` 网络配置，请确认 Windows 当前网络为「专用网络」；若反代进程与 `pc-work-mcp` 运行在同一台 Windows 上且仅回环走 `127.0.0.1`，可跳过此步。）
+
+### 第三步：启动服务并连接
 
 建议直接从已复制好的工作区目录启动：
 
