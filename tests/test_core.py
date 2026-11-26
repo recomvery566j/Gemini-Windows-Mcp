@@ -27,10 +27,12 @@ from server import (  # noqa: E402
     JsonRpcError,
     McpCore,
     McpServer,
+    WorkspaceSelectionCancelled,
     deep_merge,
     ensure_first_run_workspace,
     is_local_token_configured,
     issue_local_token,
+    load_config,
     main as server_main,
     verify_public_tcp_reachability,
 )
@@ -323,7 +325,36 @@ class TestMcpCore(unittest.TestCase):
         self.assertIn(f"鉴权 Token : {issued_tok}", cli_out)
         self.assertIn("请立即复制并保存", cli_out)
 
+        # Verify explicit --config stays non-interactive exit code 2 even when stdin.isatty() is True,
+        # while interactive double-click wizard issues token + syncs effective_cfg_path + continues cleanly
+        from unittest.mock import patch
+        from server import _run_interactive_token_wizard
+
+        empty_tok_cfg_path = self.root / "empty_tok_cfg.json"
+        empty_tok_cfg_path.write_text(json.dumps(raw_cfg), encoding="utf-8")
+        with patch("sys.stdin.isatty", return_value=True):
+            rc_auto_strict = server_main(["--config", str(empty_tok_cfg_path)])
+        self.assertEqual(rc_auto_strict, 2)
+
+        wiz_src_cfg = self.root / "wiz_src" / "config.json"
+        wiz_eff_cfg = self.root / "wiz_ws" / "Gemini-Windows-Mcp" / "config.json"
+        wiz_init_obj = deep_merge(raw_cfg, {"workspace": {"initialized": True, "default_dir": str(self.root / "wiz_ws")}})
+        wiz_src_cfg.parent.mkdir(parents=True, exist_ok=True)
+        wiz_eff_cfg.parent.mkdir(parents=True, exist_ok=True)
+        wiz_src_cfg.write_text(json.dumps(wiz_init_obj), encoding="utf-8")
+        wiz_eff_cfg.write_text(json.dumps(wiz_init_obj), encoding="utf-8")
+        wiz_buf = io.StringIO()
+        inputs = iter(["", "", ""])
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", lambda _prompt="": next(inputs)), contextlib.redirect_stdout(wiz_buf):
+            should_start = _run_interactive_token_wizard(wiz_src_cfg, wiz_eff_cfg)
+        self.assertTrue(should_start)
+        wiz_tok = json.loads(wiz_eff_cfg.read_text(encoding="utf-8"))["auth"]["token"]
+        self.assertTrue(wiz_tok.startswith("pcmcp_"))
+        self.assertIn(f"鉴权 Token : {wiz_tok}", wiz_buf.getvalue())
+
     def test_first_run_workspace_selection_and_copy(self):
+        from unittest.mock import patch
+
         fake_src = self.root / "fake_dist"
         fake_src.mkdir()
         (fake_src / "server.py").write_text("# server", encoding="utf-8")
@@ -337,34 +368,102 @@ class TestMcpCore(unittest.TestCase):
             "auth": {"enabled": True, "token": ""},
             "workspace": {"initialized": False, "default_dir": ""},
             "exec": {"workdir": ""},
+            "push": {"outbox_dir": ""},
+            "log": {"file": ""},
         }
 
         cfg1 = fake_src / "config.json"
         cfg1.write_text(json.dumps(fresh_cfg), encoding="utf-8")
         fake_desktop = self.root / "Desktop"
+
+        # 1) Cancelling / no selection from raw source dir MUST abort cleanly (never silently jump to Desktop!)
+        with self.assertRaises(WorkspaceSelectionCancelled):
+            ensure_first_run_workspace(
+                cfg1,
+                requested_workspace=None,
+                interactive=False,
+                allow_gui=False,
+                desktop_dir=fake_desktop,
+                source_root=fake_src,
+            )
+        self.assertFalse((fake_desktop / "pc-work-mcp-workspace").exists())
+
+        # 2) Non-TTY launch (e.g. .vbs / pythonw) with allow_gui=True STILL invokes WinForms picker!
+        picked_ws = self.root / "VbsPickedWS"
+        with patch("server._pick_folder_winforms", return_value=picked_ws) as mock_picker:
+            res_vbs = ensure_first_run_workspace(
+                cfg1,
+                requested_workspace=None,
+                interactive=False,
+                use_gui=True,
+                allow_gui=True,
+                desktop_dir=fake_desktop,
+                source_root=fake_src,
+            )
+            self.assertEqual(mock_picker.call_count, 1)
+        expected_picked_mcp = picked_ws.resolve() / "Gemini-Windows-Mcp"
+        self.assertTrue(res_vbs["initialized_now"])
+        self.assertEqual(res_vbs["mode"], "gui_picker")
+        self.assertEqual(Path(res_vbs["workspace_dir"]), picked_ws.resolve())
+        self.assertTrue((expected_picked_mcp / "server.py").is_file())
+        self.assertFalse((picked_ws / "server.py").exists())
+        self.assertFalse((expected_picked_mcp / "__pycache__").exists())
+        self.assertFalse((expected_picked_mcp / "logs" / "old.log").exists())
+
+        # 3) Explicit use_desktop_workspace=True creates Desktop\pc-work-mcp-workspace\Gemini-Windows-Mcp
+        cfg_desk = fake_src / "cfg_desk.json"
+        cfg_desk.write_text(json.dumps(fresh_cfg), encoding="utf-8")
         res_desktop = ensure_first_run_workspace(
-            cfg1,
+            cfg_desk,
             requested_workspace=None,
             interactive=False,
+            allow_gui=False,
+            use_desktop_workspace=True,
             desktop_dir=fake_desktop,
             source_root=fake_src,
         )
         expected_ws = (fake_desktop / "pc-work-mcp-workspace").resolve()
+        expected_mcp = expected_ws / "Gemini-Windows-Mcp"
         self.assertTrue(res_desktop["initialized_now"])
+        self.assertEqual(res_desktop["mode"], "desktop_flag")
         self.assertEqual(Path(res_desktop["workspace_dir"]), expected_ws)
-        self.assertTrue((expected_ws / "server.py").is_file())
-        self.assertTrue((expected_ws / "security.py").is_file())
-        self.assertFalse((expected_ws / "__pycache__").exists())
-        self.assertFalse((expected_ws / "logs" / "old.log").exists())
-        self.assertTrue((expected_ws / "logs").is_dir())
-        self.assertTrue((expected_ws / "outbox").is_dir())
-        ws_cfg1 = json.loads((expected_ws / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(Path(res_desktop["mcp_dir"]), expected_mcp)
+        self.assertFalse((expected_ws / "server.py").exists())
+        self.assertTrue((expected_mcp / "server.py").is_file())
+        self.assertTrue((expected_mcp / "logs").is_dir())
+        self.assertTrue((expected_mcp / "outbox").is_dir())
+        ws_cfg1 = json.loads((expected_mcp / "config.json").read_text(encoding="utf-8"))
         self.assertTrue(ws_cfg1["workspace"]["initialized"])
         self.assertEqual(ws_cfg1["workspace"]["default_dir"], str(expected_ws))
 
-        res_again = ensure_first_run_workspace(cfg1, interactive=False, desktop_dir=fake_desktop, source_root=fake_src)
+        res_again = ensure_first_run_workspace(cfg_desk, interactive=False, allow_gui=False, desktop_dir=fake_desktop, source_root=fake_src)
         self.assertFalse(res_again["initialized_now"])
 
+        # 4) Already inside Gemini-Windows-Mcp subdir with empty default_dir: load_config & cancel fall back to clean outer dir
+        outer_ws = (self.root / "CleanOuterWS").resolve()
+        inner_mcp = outer_ws / "Gemini-Windows-Mcp"
+        inner_mcp.mkdir(parents=True)
+        inner_cfg = inner_mcp / "config.json"
+        inner_cfg.write_text(json.dumps(fresh_cfg), encoding="utf-8")
+        loaded_inner = load_config(str(inner_cfg))
+        self.assertEqual(Path(loaded_inner["workspace"]["default_dir"]), outer_ws)
+        self.assertEqual(Path(loaded_inner["exec"]["workdir"]), outer_ws)
+        self.assertEqual(Path(loaded_inner["log"]["file"]), inner_mcp / "logs" / "server.log")
+
+        res_inner = ensure_first_run_workspace(
+            inner_cfg,
+            requested_workspace=None,
+            interactive=False,
+            allow_gui=False,
+            desktop_dir=fake_desktop,
+            source_root=inner_mcp,
+        )
+        self.assertTrue(res_inner["initialized_now"])
+        self.assertEqual(res_inner["mode"], "outer_clean_dir")
+        self.assertEqual(Path(res_inner["workspace_dir"]), outer_ws)
+        self.assertEqual(Path(res_inner["mcp_dir"]), inner_mcp)
+
+        # 5) Explicit --workspace path + token sync
         cfg2 = self.root / "cfg2.json"
         cfg2.write_text(json.dumps(fresh_cfg), encoding="utf-8")
         custom_ws = self.root / "CustomAgentWS"
@@ -372,15 +471,19 @@ class TestMcpCore(unittest.TestCase):
             cfg2,
             requested_workspace=str(custom_ws),
             interactive=False,
+            allow_gui=False,
             desktop_dir=fake_desktop,
             source_root=fake_src,
         )
+        custom_mcp = custom_ws.resolve() / "Gemini-Windows-Mcp"
         self.assertTrue(res_custom["initialized_now"])
         self.assertEqual(Path(res_custom["workspace_dir"]), custom_ws.resolve())
-        self.assertTrue((custom_ws / "server.py").is_file())
+        self.assertEqual(Path(res_custom["mcp_dir"]), custom_mcp)
+        self.assertFalse((custom_ws / "server.py").exists())
+        self.assertTrue((custom_mcp / "server.py").is_file())
         tok_res = issue_local_token(cfg2)
         self.assertTrue(tok_res["issued"])
-        synced = json.loads((custom_ws / "config.json").read_text(encoding="utf-8"))
+        synced = json.loads((custom_mcp / "config.json").read_text(encoding="utf-8"))
         self.assertEqual(synced["auth"]["token"], tok_res["token"])
 
     def test_tampermonkey_bridge_turn1_upload_and_save_flow(self):
@@ -1521,6 +1624,9 @@ class TestMcpCore(unittest.TestCase):
             srv.server_close()
 
     def test_startup_dual_stack_tcp_self_check_lock(self):
+        # 0) Default config keeps startup_tcp_check=False so running without domain/proxy never exits unexpectedly
+        self.assertFalse(DEFAULT_CONFIG["oauth"]["startup_tcp_check"])
+
         # 1) Loopback / RFC1918 / non-global addresses are cleanly skipped; public domain runs probe
         self.assertEqual(verify_public_tcp_reachability("https://127.0.0.1:15672")["status"], "skipped")
         self.assertEqual(verify_public_tcp_reachability("https://192.0.2.10:15672")["status"], "skipped")
@@ -1543,7 +1649,7 @@ class TestMcpCore(unittest.TestCase):
         )
         self.assertEqual(res_api_down["status"], "unavailable")
 
-        # 4) Both IPv6 and IPv4 unreachable -> self-check lock aborts server_main with exit code 2
+        # 4) Explicit startup_tcp_check=True with unreachable endpoint aborts server_main with exit code 2
         from unittest.mock import patch
         cfg_path = self.root / "lock_cfg.json"
         lock_cfg = deep_merge(DEFAULT_CONFIG, {
@@ -1563,11 +1669,303 @@ class TestMcpCore(unittest.TestCase):
             "port": 14769,
             "reachable_families": [],
             "families": {"ipv6": {"state": "closed"}, "ipv4": {"state": "dns_missing"}},
-        }):
+        }) as mock_probe:
             rc_locked = server_main(["--config", str(cfg_path)])
             self.assertEqual(rc_locked, 2)
             rc_cli_chk = server_main(["--config", str(cfg_path), "--check-public-url"])
             self.assertEqual(rc_cli_chk, 2)
+            self.assertGreaterEqual(mock_probe.call_count, 2)
+
+        # 5) Bridge /bridge/public_url & /bridge/check_public_url require local admin token and allow Tampermonkey testing + save
+        tok = "pcmcp_pub_bridge_tok"
+        srv_cfg = deep_merge(self.cfg, {
+            "auth": {"enabled": True, "token": tok},
+            "oauth": {"enabled": True, "public_base_url": "", "startup_tcp_check": False},
+        })
+        bridge_cfg_path = self.root / "bridge_pub_cfg.json"
+        bridge_cfg_path.write_text(json.dumps(srv_cfg), encoding="utf-8")
+        core = McpCore(srv_cfg, config_path=bridge_cfg_path)
+        srv = McpServer(("127.0.0.1", 0), Handler, core, srv_cfg)
+        port = srv.server_address[1]
+        base = f"http://127.0.0.1:{port}"
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            def call(path, method="GET", body=None, bearer=tok):
+                headers = {"Authorization": f"Bearer {bearer}"}
+                data = None
+                if body is not None:
+                    data = json.dumps(body).encode("utf-8")
+                    headers["Content-Type"] = "application/json"
+                req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        return resp.status, json.loads(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as he:
+                    return he.code, json.loads(he.read().decode("utf-8"))
+
+            # Unregistered token gets 401; real Google OAuth access token gets 403
+            st_unauth, _ = call("/bridge/public_url", bearer="invalid_token")
+            self.assertEqual(st_unauth, 401)
+            oauth_at, _ = srv.oauth.issue_tokens("google_client_pub")
+            st_forbid, _ = call("/bridge/public_url", bearer=oauth_at)
+            self.assertEqual(st_forbid, 403)
+
+            st0, g0 = call("/bridge/public_url")
+            self.assertEqual(st0, 200)
+            self.assertFalse(g0["startup_tcp_check"])
+            self.assertEqual(g0["public_base_url"], "")
+
+            with patch("server.verify_public_tcp_reachability", return_value={
+                "status": "reachable",
+                "host": "pub.example.com",
+                "port": 14769,
+                "reachable_families": ["IPv6"],
+                "families": {"ipv6": {"state": "open"}, "ipv4": {"state": "dns_missing"}},
+            }):
+                st1, p1 = call("/bridge/check_public_url", method="POST", body={
+                    "public_base_url": "https://pub.example.com:14769/",
+                    "save": True,
+                })
+            self.assertEqual(st1, 200)
+            self.assertTrue(p1["saved"])
+            self.assertEqual(p1["public_base_url"], "https://pub.example.com:14769")
+            self.assertEqual(p1["check"]["status"], "reachable")
+            self.assertEqual(srv.oauth.configured_base, "https://pub.example.com:14769")
+            saved_disk = json.loads(bridge_cfg_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_disk["oauth"]["public_base_url"], "https://pub.example.com:14769")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_global_whitelist_cross_conversation_and_bridge_api(self):
+        diary_rw = self.root / "my_diary_rw"
+        diary_rw.mkdir(parents=True, exist_ok=True)
+        (diary_rw / "2026-11-26.md").write_text("today note alpha", encoding="utf-8")
+
+        notes_ro = self.root / "archive_ro"
+        notes_ro.mkdir(parents=True, exist_ok=True)
+        (notes_ro / "ref.txt").write_text("readonly reference", encoding="utf-8")
+
+        outside_dir = self.root / "outside_other"
+        outside_dir.mkdir(parents=True, exist_ok=True)
+        (outside_dir / "secret.txt").write_text("outside secret", encoding="utf-8")
+
+        tok = "pcmcp_wl_admin_tok"
+        cfg_path = self.root / "wl_cfg.json"
+        wl_cfg = deep_merge(self.cfg, {
+            "auth": {"enabled": True, "token": tok},
+            "oauth": {"enabled": True, "public_base_url": "https://pcmcp.example.com:14769"},
+            "workspace": {
+                "initialized": True,
+                "default_dir": str(self.ws),
+                "extra_allowed_dirs": [
+                    str(diary_rw),  # Legacy string format -> readwrite, allow_exec=False
+                    {"path": str(notes_ro), "mode": "readonly", "label": "ArchiveRO"},
+                ],
+                "popup_approval": {"enabled": False, "timeout_sec": 5},
+            },
+            "permissions": {
+                "per_conversation_enabled": True,
+                "new_conversation_default_profile": "ask",
+                "approval_timeout_sec": 5,
+            },
+        })
+        cfg_path.write_text(json.dumps(wl_cfg), encoding="utf-8")
+        core = McpCore(wl_cfg, approval_cb=lambda *a: (False, False), config_path=cfg_path)
+        srv = McpServer(("127.0.0.1", 0), Handler, core, wl_cfg)
+        port = srv.server_address[1]
+        base = f"http://127.0.0.1:{port}"
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+
+        def req(path, method="GET", body=None, bearer=tok):
+            headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
+            data = None
+            if body is not None:
+                data = json.dumps(body).encode("utf-8")
+                headers["Content-Type"] = "application/json"
+            r = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(r, timeout=8) as resp:
+                    return resp.status, json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+
+        try:
+            # 1) New conversation on default "ask" profile: reads & writes inside readwrite whitelist succeed without prompt
+            core.bridge.heartbeat({
+                "tab_id": "tab_wl_1",
+                "conversation_id": "cid_wl_chat1",
+                "url": "https://gemini.google.com/app/cid_wl_chat1",
+                "is_generating": True,
+            })
+
+            st_ws = core.handle("tools/call", {"name": "workspace_status", "arguments": {}})
+            ws_obj = json.loads(st_ws["content"][0]["text"])
+            wl_paths = {w["path"]: w for w in ws_obj["global_whitelist"]}
+            self.assertEqual(wl_paths[str(diary_rw.resolve())]["mode"], "readwrite")
+            self.assertEqual(wl_paths[str(notes_ro.resolve())]["mode"], "readonly")
+
+            r_list = core.handle("tools/call", {"name": "list_dir", "arguments": {"path": str(diary_rw)}})
+            self.assertFalse(r_list["isError"])
+            self.assertIn("2026-11-26.md", r_list["content"][0]["text"])
+
+            r_find = core.handle("tools/call", {"name": "find_files", "arguments": {"path": str(diary_rw), "pattern": "*.md"}})
+            self.assertFalse(r_find["isError"])
+            self.assertIn("2026-11-26.md", r_find["content"][0]["text"])
+
+            r_grep = core.handle("tools/call", {"name": "grep_search", "arguments": {"path": str(diary_rw), "query": "alpha"}})
+            self.assertFalse(r_grep["isError"])
+            self.assertIn("today note alpha", r_grep["content"][0]["text"])
+
+            r_read = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(diary_rw / "2026-11-26.md")}})
+            self.assertFalse(r_read["isError"])
+            self.assertIn("today note alpha", r_read["content"][0]["text"])
+
+            r_write = core.handle("tools/call", {
+                "name": "write_file",
+                "arguments": {"path": str(diary_rw / "new_entry.md"), "content": "written from ask chat"},
+            })
+            self.assertFalse(r_write["isError"])
+            self.assertEqual((diary_rw / "new_entry.md").read_text(encoding="utf-8"), "written from ask chat")
+
+            r_edit = core.handle("tools/call", {
+                "name": "edit_file",
+                "arguments": {"path": str(diary_rw / "new_entry.md"), "old_text": "ask chat", "new_text": "edited ask chat"},
+            })
+            self.assertFalse(r_edit["isError"])
+            self.assertEqual((diary_rw / "new_entry.md").read_text(encoding="utf-8"), "written from edited ask chat")
+
+            r_bupl = core.handle("tools/call", {
+                "name": "bridge_upload_media",
+                "arguments": {"files": [str(diary_rw / "new_entry.md")], "prompt": "read diary"},
+            })
+            self.assertFalse(r_bupl["isError"])
+            r_bsav = core.handle("tools/call", {
+                "name": "bridge_save_generated_media",
+                "arguments": {"target_path": str(diary_rw / "generated")},
+            })
+            self.assertFalse(r_bsav["isError"])
+
+            # 2) Readonly whitelist entry allows read/search, blocks write_file
+            r_ro_read = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(notes_ro / "ref.txt")}})
+            self.assertFalse(r_ro_read["isError"])
+            self.assertIn("readonly reference", r_ro_read["content"][0]["text"])
+
+            core.permissions.approval_timeout_sec = 1
+            r_ro_write = core.handle("tools/call", {
+                "name": "write_file",
+                "arguments": {"path": str(notes_ro / "mutate.txt"), "content": "nope"},
+            })
+            self.assertTrue(r_ro_write["isError"])
+            self.assertFalse((notes_ro / "mutate.txt").exists())
+
+            # Normal outside path STILL blocked under "ask"
+            r_out = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(outside_dir / "secret.txt")}})
+            self.assertTrue(r_out["isError"])
+
+            # Default allow_exec=False STILL gates python even with cwd inside whitelist
+            r_exec_blocked = core.handle("tools/call", {
+                "name": "python",
+                "arguments": {"code": "print(1+1)", "cwd": str(diary_rw)},
+            })
+            self.assertTrue(r_exec_blocked["isError"])
+
+            # 3) Control plane /bridge/whitelist security + CRUD + hot reload + allow_exec
+            oauth_at, _ = srv.oauth.issue_tokens("google_wl_client")
+            st_forbid, _ = req("/bridge/whitelist", bearer=oauth_at)
+            self.assertEqual(st_forbid, 403)
+            st_unauth, _ = req("/bridge/whitelist", bearer="bad_tok")
+            self.assertEqual(st_unauth, 401)
+
+            dynamic_dir = self.root / "dynamic_notes"
+            dynamic_dir.mkdir(parents=True, exist_ok=True)
+            (dynamic_dir / "hello.md").write_text("dynamic hi", encoding="utf-8")
+
+            st_add, add_res = req("/bridge/whitelist", method="POST", body={
+                "action": "add",
+                "path": f'"{dynamic_dir}"',
+                "mode": "readwrite",
+                "allow_exec": False,
+            })
+            self.assertEqual(st_add, 200)
+            self.assertTrue(any(e["path"] == str(dynamic_dir.resolve()) for e in add_res["entries"]))
+
+            saved_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            self.assertTrue(any(
+                isinstance(x, dict) and x.get("path") == str(dynamic_dir.resolve())
+                for x in saved_cfg["workspace"]["extra_allowed_dirs"]
+            ))
+
+            # Immediately readable without restart in the same "ask" conversation
+            r_dyn = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(dynamic_dir / "hello.md")}})
+            self.assertFalse(r_dyn["isError"])
+            self.assertIn("dynamic hi", r_dyn["content"][0]["text"])
+
+            # Enable allow_exec=True for diary_rw -> cwd=diary_rw passes without external write, but writing outside still blocks
+            st_upd, upd_res = req("/bridge/whitelist", method="POST", body={
+                "action": "update",
+                "path": str(diary_rw),
+                "allow_exec": True,
+            })
+            self.assertEqual(st_upd, 200)
+            self.assertTrue(upd_res["entry"]["allow_exec"])
+
+            r_py_ok = core.handle("tools/call", {
+                "name": "python",
+                "arguments": {"code": "print('WL_EXEC_OK')", "cwd": str(diary_rw)},
+            })
+            self.assertFalse(r_py_ok["isError"])
+            self.assertIn("WL_EXEC_OK", r_py_ok["content"][0]["text"])
+
+            r_py_escape = core.handle("tools/call", {
+                "name": "python",
+                "arguments": {
+                    "code": f"open(r'{outside_dir / 'evil.txt'}', 'w').write('x')",
+                    "cwd": str(diary_rw),
+                },
+            })
+            self.assertTrue(r_py_escape["isError"])
+            self.assertFalse((outside_dir / "evil.txt").exists())
+
+            # Protected control-plane files remain unmodifiable even if parent folder is whitelisted
+            st_add_root, _ = req("/bridge/whitelist", method="POST", body={
+                "action": "add",
+                "path": str(self.root),
+                "mode": "readwrite",
+            })
+            self.assertEqual(st_add_root, 200)
+            r_prot = core.handle("tools/call", {
+                "name": "write_file",
+                "arguments": {"path": str(cfg_path), "content": "{}"},
+            })
+            self.assertTrue(r_prot["isError"])
+            self.assertIn("PermissionDenied", r_prot["content"][0]["text"])
+
+            # Removing entry revokes instant access on "ask"
+            st_rem, _ = req("/bridge/whitelist", method="POST", body={"action": "remove", "path": str(self.root)})
+            self.assertEqual(st_rem, 200)
+            st_rem2, _ = req("/bridge/whitelist", method="POST", body={"action": "remove", "path": str(dynamic_dir)})
+            self.assertEqual(st_rem2, 200)
+            r_revoked = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(dynamic_dir / "hello.md")}})
+            self.assertTrue(r_revoked["isError"])
+
+            # 4) Explicit "deny" conversation profile ALWAYS wins even over global whitelist
+            core.permissions.set_policy(conversation_id="cid_wl_chat1", profile="deny", scope="persistent")
+            r_denied = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(diary_rw / "2026-11-26.md")}})
+            self.assertTrue(r_denied["isError"])
+            self.assertIn("禁止", r_denied["content"][0]["text"])
+
+            # 5) Blocked prefix cannot be added to global whitelist
+            st_blk, _ = req("/bridge/whitelist", method="POST", body={
+                "action": "add",
+                "path": str(self.blocked),
+            })
+            self.assertEqual(st_blk, 400)
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

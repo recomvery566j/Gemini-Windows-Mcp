@@ -9,9 +9,10 @@ import os
 import re
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 LOG = logging.getLogger("pc-work-mcp.security")
 IS_WINDOWS = os.name == "nt"
@@ -34,6 +35,8 @@ class PermissionDeniedByUser(PermissionError):
 def normalize_path_str(raw_path: str) -> str:
     """Convert Git Bash / MSYS2 (/g/foo) or mixed-slash paths into clean Windows paths."""
     s = str(raw_path or "").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        s = s[1:-1].strip()
     if not s:
         return s
     m = _MSYS_PATH_RE.match(s)
@@ -222,23 +225,12 @@ class WorkspaceBoundaryGuard:
         ws = cfg.get("workspace") or {}
         self.default_dir = resolve_path(ws.get("default_dir") or str((cfg.get("exec") or {}).get("workdir") or Path.home()))
 
-        extra = [resolve_path(p) for p in (ws.get("extra_allowed_dirs") or []) if p]
         outbox_cfg = (cfg.get("push") or {}).get("outbox_dir")
         outbox_dir = resolve_path(outbox_cfg) if outbox_cfg else (self.server_root / "outbox")
-        self.shared_green_dirs: list[Path] = []
-        for d in [*extra, outbox_dir, self.server_root / "tmp"]:
-            if d not in self.shared_green_dirs:
-                self.shared_green_dirs.append(d)
-
-        self.green_dirs: list[Path] = []
-        for d in [
-            self.default_dir,
-            self.default_dir / ".tmp_outputs",
-            self.default_dir / ".mcp_snapshots",
-            *self.shared_green_dirs,
-        ]:
-            if d not in self.green_dirs:
-                self.green_dirs.append(d)
+        self._base_shared_dirs: list[Path] = []
+        for d in [outbox_dir, self.server_root / "tmp"]:
+            if d not in self._base_shared_dirs:
+                self._base_shared_dirs.append(d)
 
         self.blocked_read_prefixes: list[Path] = [
             resolve_path(p) for p in (ws.get("blocked_read_prefixes") or []) if p
@@ -259,6 +251,248 @@ class WorkspaceBoundaryGuard:
         self._lock = threading.Lock()
         self.session_trusted_dirs: list[Path] = []
         self._approval_cb = approval_cb
+        self.whitelist_entries: list[dict[str, Any]] = []
+        self.shared_green_dirs: list[Path] = []
+        self.green_dirs: list[Path] = []
+        self._load_whitelist_from_raw(ws.get("extra_allowed_dirs") or [])
+        with self._lock:
+            self._rebuild_green_dirs_locked()
+
+    def _normalize_whitelist_entry(self, item: Any, *, require_exists: bool = False) -> dict[str, Any] | None:
+        if isinstance(item, str):
+            raw_path = item.strip()
+            mode = "readwrite"
+            allow_exec = False
+            label = ""
+            added_at = 0.0
+        elif isinstance(item, dict):
+            raw_path = str(item.get("path") or item.get("dir") or "").strip()
+            mode = str(item.get("mode") or "readwrite").strip().lower()
+            allow_exec = bool(item.get("allow_exec", False))
+            label = str(item.get("label") or "").strip()
+            added_at = float(item.get("added_at") or 0.0)
+        else:
+            return None
+        if not raw_path:
+            return None
+        if mode not in ("readwrite", "readonly"):
+            raise ValueError(f"invalid whitelist mode: {mode!r} (expected 'readwrite' or 'readonly')")
+        if mode == "readonly":
+            allow_exec = False
+        target = resolve_path(raw_path, base_dir=self.default_dir)
+        if self.is_blocked_read(target):
+            raise ValueError(f"whitelist directory is inside blocked path: {target}")
+        if require_exists and not target.is_dir():
+            raise ValueError(f"whitelist directory does not exist: {target}")
+        return {
+            "path": str(target),
+            "label": label or target.name or str(target),
+            "mode": mode,
+            "allow_exec": allow_exec,
+            "added_at": added_at or time.time(),
+        }
+
+    def _load_whitelist_from_raw(self, raw_items: list[Any]) -> None:
+        loaded: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            try:
+                norm = self._normalize_whitelist_entry(item, require_exists=False)
+            except ValueError as exc:
+                LOG.warning("ignoring invalid extra_allowed_dirs entry %r: %s", item, exc)
+                continue
+            if not norm:
+                continue
+            key = os.path.normcase(norm["path"])
+            if key in seen:
+                continue
+            seen.add(key)
+            loaded.append(norm)
+        with self._lock:
+            self.whitelist_entries = loaded
+
+    def _rebuild_green_dirs_locked(self) -> None:
+        writable_wl = [
+            Path(e["path"]) for e in self.whitelist_entries
+            if e.get("mode", "readwrite") == "readwrite"
+        ]
+        shared: list[Path] = []
+        for d in [*writable_wl, *self._base_shared_dirs]:
+            if d not in shared:
+                shared.append(d)
+        self.shared_green_dirs = shared
+
+        gdirs: list[Path] = []
+        for d in [
+            self.default_dir,
+            self.default_dir / ".tmp_outputs",
+            self.default_dir / ".mcp_snapshots",
+            *self.shared_green_dirs,
+        ]:
+            if d not in gdirs:
+                gdirs.append(d)
+        self.green_dirs = gdirs
+
+    def get_global_whitelist(self) -> list[dict[str, Any]]:
+        with self._lock:
+            entries = [dict(e) for e in self.whitelist_entries]
+        for e in entries:
+            e["exists"] = Path(e["path"]).is_dir()
+        return entries
+
+    def export_whitelist_config(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    "path": e["path"],
+                    "label": e.get("label") or Path(e["path"]).name or e["path"],
+                    "mode": e.get("mode", "readwrite"),
+                    "allow_exec": bool(e.get("allow_exec", False)),
+                }
+                for e in self.whitelist_entries
+            ]
+
+    def add_global_whitelist_dir(
+        self,
+        raw_path: str,
+        *,
+        mode: str = "readwrite",
+        allow_exec: bool = False,
+        label: str = "",
+    ) -> dict[str, Any]:
+        norm = self._normalize_whitelist_entry(
+            {
+                "path": raw_path,
+                "mode": mode,
+                "allow_exec": allow_exec,
+                "label": label,
+                "added_at": time.time(),
+            },
+            require_exists=True,
+        )
+        assert norm is not None
+        key = os.path.normcase(norm["path"])
+        with self._lock:
+            for idx, existing in enumerate(self.whitelist_entries):
+                if os.path.normcase(existing["path"]) == key:
+                    merged = dict(existing)
+                    merged["mode"] = norm["mode"]
+                    merged["allow_exec"] = norm["allow_exec"]
+                    if label:
+                        merged["label"] = label.strip()
+                    self.whitelist_entries[idx] = merged
+                    self._rebuild_green_dirs_locked()
+                    out = dict(merged)
+                    out["exists"] = True
+                    return out
+            self.whitelist_entries.append(norm)
+            self._rebuild_green_dirs_locked()
+            out = dict(norm)
+        out["exists"] = True
+        return out
+
+    def update_global_whitelist_dir(
+        self,
+        raw_path: str,
+        *,
+        mode: str | None = None,
+        allow_exec: bool | None = None,
+        label: str | None = None,
+    ) -> dict[str, Any]:
+        cleaned = normalize_path_str(raw_path)
+        if not cleaned:
+            raise ValueError("path is required")
+        target = resolve_path(cleaned, base_dir=self.default_dir)
+        key = os.path.normcase(str(target))
+        with self._lock:
+            for idx, existing in enumerate(self.whitelist_entries):
+                if os.path.normcase(existing["path"]) != key:
+                    continue
+                updated = dict(existing)
+                if mode is not None:
+                    m_norm = str(mode).strip().lower()
+                    if m_norm not in ("readwrite", "readonly"):
+                        raise ValueError(f"invalid whitelist mode: {mode!r}")
+                    updated["mode"] = m_norm
+                    if m_norm == "readonly":
+                        updated["allow_exec"] = False
+                if allow_exec is not None:
+                    updated["allow_exec"] = bool(allow_exec) if updated.get("mode", "readwrite") == "readwrite" else False
+                if label is not None and label.strip():
+                    updated["label"] = label.strip()
+                self.whitelist_entries[idx] = updated
+                self._rebuild_green_dirs_locked()
+                out = dict(updated)
+                out["exists"] = Path(out["path"]).is_dir()
+                return out
+        raise ValueError(f"whitelist directory not found: {target}")
+
+    def remove_global_whitelist_dir(self, raw_path: str) -> bool:
+        cleaned = normalize_path_str(raw_path)
+        if not cleaned:
+            return False
+        target = resolve_path(cleaned, base_dir=self.default_dir)
+        key = os.path.normcase(str(target))
+        with self._lock:
+            before = len(self.whitelist_entries)
+            self.whitelist_entries = [
+                e for e in self.whitelist_entries
+                if os.path.normcase(e["path"]) != key
+            ]
+            removed = len(self.whitelist_entries) != before
+            if removed:
+                self._rebuild_green_dirs_locked()
+            return removed
+
+    def match_whitelist_entry(self, target: Path) -> dict[str, Any] | None:
+        """Return the most-specific global whitelist entry covering `target`, if any."""
+        with self._lock:
+            entries = list(self.whitelist_entries)
+        best: dict[str, Any] | None = None
+        best_len = -1
+        for entry in entries:
+            ep = Path(entry["path"])
+            if _is_under(target, ep):
+                elen = len(os.path.normcase(str(ep)))
+                if elen > best_len:
+                    best = dict(entry)
+                    best_len = elen
+        return best
+
+    def is_whitelisted_for_action(
+        self,
+        raw_path: str,
+        *,
+        access: str = "read",
+        active_workspace: Path | None = None,
+    ) -> bool:
+        """Check whether `raw_path` falls under a global whitelist entry granting `access`."""
+        eff_ws = self._effective_workspace(active_workspace)
+        target = resolve_path(raw_path, base_dir=eff_ws)
+        if self.is_blocked_read(target):
+            return False
+        if access in ("write", "exec") and self.is_protected_write(target):
+            return False
+        entry = self.match_whitelist_entry(target)
+        if not entry:
+            return False
+        mode = entry.get("mode", "readwrite")
+        if access == "read":
+            return mode in ("readonly", "readwrite")
+        if access == "write":
+            return mode == "readwrite"
+        if access == "exec":
+            return mode == "readwrite" and bool(entry.get("allow_exec", False))
+        return False
+
+    def has_protected_write_reference(self, code: str) -> str | None:
+        if not _WRITE_HINT_RE.search(code):
+            return None
+        lowered = code.lower()
+        for fp in self.protected_write_files:
+            if fp.name.lower() in lowered:
+                return fp.name
+        return None
 
     def _effective_workspace(self, active_workspace: Path | None = None) -> Path:
         if active_workspace is None:
@@ -267,10 +501,13 @@ class WorkspaceBoundaryGuard:
 
     def _green_dirs_for(self, active_workspace: Path | None = None) -> tuple[Path, list[Path]]:
         eff_ws = self._effective_workspace(active_workspace)
+        with self._lock:
+            base_gdirs = list(self.green_dirs)
+            shared = list(self.shared_green_dirs)
         if os.path.normcase(str(eff_ws)) == os.path.normcase(str(self.default_dir)):
-            return self.default_dir, list(self.green_dirs)
+            return self.default_dir, base_gdirs
         dirs: list[Path] = []
-        for d in [eff_ws, eff_ws / ".tmp_outputs", eff_ws / ".mcp_snapshots", *self.shared_green_dirs]:
+        for d in [eff_ws, eff_ws / ".tmp_outputs", eff_ws / ".mcp_snapshots", *shared]:
             if d not in dirs:
                 dirs.append(d)
         return eff_ws, dirs
@@ -288,7 +525,11 @@ class WorkspaceBoundaryGuard:
         t_norm = os.path.normcase(str(target))
         for p in self.protected_write_files:
             p_norm = os.path.normcase(str(p))
-            if t_norm == p_norm or t_norm == os.path.normcase(str(p.with_suffix(".tmp"))):
+            if (
+                t_norm == p_norm
+                or t_norm == os.path.normcase(str(p.with_suffix(".tmp")))
+                or t_norm == os.path.normcase(str(p) + ".tmp")
+            ):
                 return True
         return False
 
@@ -322,9 +563,16 @@ class WorkspaceBoundaryGuard:
                 f"PermissionDenied: {tool_name} cannot modify control-plane file '{target}'. "
                 "权限与鉴权配置仅由本机与油猴本地桥管理，不由会话内 Agent 修改。"
             )
+        if zone == "blocked":
+            raise PermissionDeniedByUser(
+                f"PermissionDenied: {tool_name} cannot write protected path: {target}"
+            )
         if zone == "green":
             return target
         # External write -> Red Zone
+        wl = self.match_whitelist_entry(target)
+        if wl and wl.get("mode") == "readonly":
+            summary = f"{summary}（该目录在全局白名单中设为仅只读）" if summary else "该目录在全局白名单中设为仅只读"
         parent = str(target.parent)
         self._require_approval(tool_name, str(target), summary, parent, effective_ws=eff_ws)
         return target
@@ -337,12 +585,11 @@ class WorkspaceBoundaryGuard:
             raise PermissionDeniedByUser(
                 f"PermissionDenied: {tool_name} cwd is in protected directory: {workdir}"
             )
-        if _WRITE_HINT_RE.search(code):
-            for fp in self.protected_write_files:
-                if fp.name.lower() in code.lower():
-                    raise PermissionDeniedByUser(
-                        f"PermissionDenied: {tool_name} script appears to modify protected control-plane file ({fp.name})."
-                    )
+        prot_hit = self.has_protected_write_reference(code)
+        if prot_hit:
+            raise PermissionDeniedByUser(
+                f"PermissionDenied: {tool_name} script appears to modify protected control-plane file ({prot_hit})."
+            )
         cwd_green = self.is_green(workdir, active_workspace=eff_ws)
         external_targets = self._detect_external_write_targets(code, workdir, active_workspace=eff_ws)
         if cwd_green and not external_targets:

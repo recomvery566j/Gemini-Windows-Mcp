@@ -62,6 +62,19 @@ except ImportError:
     HAS_PIL = False
 
 IS_WINDOWS = os.name == "nt"
+MCP_RUNTIME_SUBDIR = "Gemini-Windows-Mcp"
+
+
+def _default_clean_workspace_dir(src_dir: Path | None = None) -> Path:
+    """若脚本已位于 Gemini-Windows-Mcp 子目录，默认回退到外层干净工作区目录；否则留在当前目录。"""
+    base = (src_dir or HERE).resolve(strict=False)
+    if base.name == MCP_RUNTIME_SUBDIR:
+        return base.parent.resolve(strict=False)
+    return base
+
+
+class WorkspaceSelectionCancelled(RuntimeError):
+    """首次运行用户取消选择工作区且拒绝隐式回退时抛出。"""
 
 DEFAULT_IGNORED_DIRS = frozenset({
     ".git",
@@ -96,11 +109,11 @@ DEFAULT_CONFIG = {
         "authorize_password": "",
         "access_token_ttl_sec": 28800,
         "refresh_token_ttl_sec": 2592000,
-        "startup_tcp_check": True,
+        "startup_tcp_check": False,
     },
     "workspace": {
         "initialized": False,
-        "default_dir": str(HERE),
+        "default_dir": "",
         "extra_allowed_dirs": [],
         "blocked_read_prefixes": [
             r"C:\Windows\System32",
@@ -121,7 +134,7 @@ DEFAULT_CONFIG = {
         "max_sync_timeout_sec": 180,
         "max_inline_chars": 16000,
         "max_concurrency": 4,
-        "workdir": str(HERE),
+        "workdir": "",
         "powershell_exe": "",
         "python_exe": "",
         "bash_exe": "",
@@ -133,7 +146,7 @@ DEFAULT_CONFIG = {
         "canary_pixel": True,
     },
     "push": {
-        "outbox_dir": str(HERE / "outbox"),
+        "outbox_dir": "",
         "url_ttl_sec": 86400,
     },
     "permissions": {
@@ -163,7 +176,7 @@ DEFAULT_CONFIG = {
         "max_handoff_chars": 220,
     },
     "log": {
-        "file": str(HERE / "logs" / "server.log"),
+        "file": "",
         "level": "INFO",
     },
 }
@@ -220,18 +233,19 @@ def deep_merge(base, override):
 
 def load_config(path: str | None):
     cfg = deep_merge(DEFAULT_CONFIG, {})
+    cfg_base = Path(path).resolve(strict=False).parent if path else HERE
     if path and os.path.isfile(path):
         with open(path, "r", encoding="utf-8-sig") as fh:
             user = json.load(fh)
         cfg = deep_merge(cfg, user)
     if not str((cfg.get("workspace") or {}).get("default_dir") or "").strip():
-        cfg.setdefault("workspace", {})["default_dir"] = str(HERE)
+        cfg.setdefault("workspace", {})["default_dir"] = str(_default_clean_workspace_dir(cfg_base))
     if not str((cfg.get("exec") or {}).get("workdir") or "").strip():
         cfg.setdefault("exec", {})["workdir"] = str(cfg["workspace"]["default_dir"])
     if not str((cfg.get("push") or {}).get("outbox_dir") or "").strip():
-        cfg["push"]["outbox_dir"] = str(HERE / "outbox")
+        cfg["push"]["outbox_dir"] = str(cfg_base / "outbox")
     if not str((cfg.get("log") or {}).get("file") or "").strip():
-        cfg["log"]["file"] = str(HERE / "logs" / "server.log")
+        cfg["log"]["file"] = str(cfg_base / "logs" / "server.log")
     return cfg
 
 
@@ -328,8 +342,28 @@ def _sync_config_file(path: Path, updater) -> dict:
     return disk
 
 
+def _resolve_mcp_runtime_dir(ws_dir: Path) -> Path:
+    """工作区根目录保持洁净，所有 MCP 源码/配置统一放在 Gemini-Windows-Mcp 子目录下。"""
+    resolved = ws_dir.resolve(strict=False)
+    if resolved.name == MCP_RUNTIME_SUBDIR:
+        return resolved
+    return resolved / MCP_RUNTIME_SUBDIR
+
+
+def _resolve_synced_config_paths(config_path: Path, ws_dir_str: str) -> list[Path]:
+    if not ws_dir_str:
+        return []
+    ws_path = Path(ws_dir_str)
+    src_res = config_path.resolve(strict=False)
+    out: list[Path] = []
+    for cand in (_resolve_mcp_runtime_dir(ws_path) / "config.json", ws_path / "config.json"):
+        if cand.is_file() and cand.resolve(strict=False) != src_res and cand not in out:
+            out.append(cand)
+    return out
+
+
 def copy_all_assets_to_workspace(src_root: Path, dst_ws: Path) -> list[str]:
-    """首次执行时将服务端全部源码、配置、文档与测试一次性复制到工作区目录内。"""
+    """首次执行时将服务端全部源码、配置、文档与测试一次性复制到独立 MCP 子目录内。"""
     src_resolved = src_root.resolve(strict=False)
     dst_resolved = dst_ws.resolve(strict=False)
     dst_resolved.mkdir(parents=True, exist_ok=True)
@@ -370,56 +404,84 @@ def ensure_first_run_workspace(
     requested_workspace: str | None = None,
     interactive: bool = True,
     use_gui: bool = True,
+    allow_gui: bool | None = None,
+    use_desktop_workspace: bool = False,
     desktop_dir: Path | None = None,
     source_root: Path | None = None,
 ) -> dict:
-    """首次运行时强制要求选择工作区（未选择则创建在当前桌面），并一次性复制全部家当进去。"""
+    """首次运行强制选择工作区：取消即中止；仅当已处于 Gemini-Windows-Mcp 子目录时回退到外层干净目录（或显式传 use_desktop_workspace）。"""
     disk = {}
     if config_path.is_file():
         with open(config_path, "r", encoding="utf-8-sig") as fh:
             disk = json.load(fh)
 
+    src_root = (source_root or HERE).resolve(strict=False)
+    in_runtime_subdir = (src_root.name == MCP_RUNTIME_SUBDIR)
+
     ws_sec = disk.get("workspace") or {}
     existing_dir = str(ws_sec.get("default_dir") or "").strip()
     already_init = bool(ws_sec.get("initialized", False))
-    if (already_init or existing_dir) and not requested_workspace:
+    if (already_init or existing_dir) and not requested_workspace and not use_desktop_workspace:
+        fallback_ws = str(_default_clean_workspace_dir(src_root))
         return {
             "initialized_now": False,
-            "workspace_dir": existing_dir or str(HERE),
+            "workspace_dir": existing_dir or fallback_ws,
             "copied_files": [],
         }
 
-    src_root = (source_root or HERE).resolve(strict=False)
     desktop_base = desktop_dir or get_windows_desktop()
     default_desktop_ws = desktop_base / "pc-work-mcp-workspace"
+    gui_allowed = (bool(interactive) and bool(use_gui) and IS_WINDOWS) if allow_gui is None else (bool(allow_gui) and bool(use_gui) and IS_WINDOWS)
 
     chosen: Path | None = None
-    source_mode = "default_desktop"
+    source_mode = "outer_clean_dir"
     if requested_workspace and requested_workspace.strip():
         chosen = Path(os.path.expanduser(os.path.expandvars(requested_workspace.strip())))
         source_mode = "cli_argument"
-    elif interactive:
-        if use_gui and IS_WINDOWS:
-            chosen = _pick_folder_winforms(
-                "pc-work-mcp 首次运行：请选择工作区目录（取消则自动在当前桌面创建）",
-                desktop_base,
+    elif use_desktop_workspace:
+        chosen = default_desktop_ws
+        source_mode = "desktop_flag"
+    else:
+        gui_tried = False
+        if gui_allowed:
+            gui_tried = True
+            picker_title = (
+                "pc-work-mcp 首次运行：请选择工作区目录（取消则留在当前外层目录）"
+                if in_runtime_subdir
+                else "pc-work-mcp 首次运行：请选择工作区目录（点取消将中止初始化，不会自动建桌面目录）"
             )
+            chosen = _pick_folder_winforms(picker_title, desktop_base)
             if chosen is not None:
                 source_mode = "gui_picker"
-        if chosen is None:
+        if chosen is None and interactive and not gui_tried:
+            prompt_msg = (
+                f"[首次运行] 请输入工作区路径（直接回车将留在当前外层干净目录 {src_root.parent}）："
+                if in_runtime_subdir
+                else "[首次运行] 请输入工作区路径（例 D:\\MyWorkspace；直接回车将取消初始化）："
+            )
             try:
-                raw_in = input(
-                    f"[首次运行] 请输入自定义工作区路径（直接回车则在桌面创建 {default_desktop_ws}）："
-                ).strip()
+                raw_in = input(prompt_msg).strip()
             except (EOFError, KeyboardInterrupt):
                 raw_in = ""
             if raw_in:
                 chosen = Path(os.path.expanduser(os.path.expandvars(raw_in)))
                 source_mode = "console_input"
 
-    ws_dir = (chosen or default_desktop_ws).resolve(strict=False)
+    if chosen is None:
+        if in_runtime_subdir:
+            chosen = src_root.parent
+            source_mode = "outer_clean_dir"
+        else:
+            raise WorkspaceSelectionCancelled(
+                "未选择工作区（已取消），未创建桌面默认目录或复制任何文件。"
+                "请重新运行并选择文件夹，或显式传 --workspace \"<路径>\" / --use-desktop-workspace。"
+            )
+
+    ws_dir = chosen.resolve(strict=False)
     ws_dir.mkdir(parents=True, exist_ok=True)
-    copied = copy_all_assets_to_workspace(src_root, ws_dir)
+    mcp_dir = _resolve_mcp_runtime_dir(ws_dir)
+    mcp_dir.mkdir(parents=True, exist_ok=True)
+    copied = copy_all_assets_to_workspace(src_root, mcp_dir)
 
     def apply_ws(cfg_obj: dict):
         w = cfg_obj.setdefault("workspace", {})
@@ -431,7 +493,7 @@ def ensure_first_run_workspace(
         cfg_obj.setdefault("log", {})["file"] = ""
 
     updated_disk = _sync_config_file(config_path, apply_ws)
-    ws_cfg_path = ws_dir / "config.json"
+    ws_cfg_path = mcp_dir / "config.json"
     if ws_cfg_path.resolve(strict=False) != config_path.resolve(strict=False):
         def copy_with_auth(cfg_obj: dict):
             apply_ws(cfg_obj)
@@ -444,6 +506,7 @@ def ensure_first_run_workspace(
         "initialized_now": True,
         "mode": source_mode,
         "workspace_dir": str(ws_dir),
+        "mcp_dir": str(mcp_dir),
         "copied_count": len(copied),
         "copied_files": copied,
     }
@@ -475,25 +538,28 @@ def issue_local_token(config_path: Path, rotate: bool = False) -> dict:
 
     updated = _sync_config_file(config_path, set_tok)
     ws_dir_str = str((updated.get("workspace") or {}).get("default_dir") or "").strip()
-    if ws_dir_str:
-        ws_cfg_path = Path(ws_dir_str) / "config.json"
-        if ws_cfg_path.is_file() and ws_cfg_path.resolve(strict=False) != config_path.resolve(strict=False):
-            _sync_config_file(ws_cfg_path, set_tok)
+    for ws_cfg_path in _resolve_synced_config_paths(config_path, ws_dir_str):
+        _sync_config_file(ws_cfg_path, set_tok)
 
     if rotate:
         cfg_eff = load_config(str(config_path))
         log_file = Path((cfg_eff.get("log") or {}).get("file") or (HERE / "logs" / "server.log"))
-        oauth_state = Path((cfg_eff.get("oauth") or {}).get("state_file") or (log_file.parent / "oauth_state.json"))
-        if oauth_state.is_file():
-            try:
-                state = json.loads(oauth_state.read_text(encoding="utf-8"))
-                state["tokens"] = {}
-                state["refresh_tokens"] = {}
-                tmp_state = oauth_state.with_suffix(".tmp")
-                tmp_state.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-                tmp_state.replace(oauth_state)
-            except Exception as exc:  # noqa: BLE001
-                LOG.warning("failed to clear old oauth tokens during rotation: %s", exc)
+        oauth_candidates = [
+            Path((cfg_eff.get("oauth") or {}).get("state_file") or (log_file.parent / "oauth_state.json")),
+        ]
+        if ws_dir_str:
+            oauth_candidates.append(_resolve_mcp_runtime_dir(Path(ws_dir_str)) / "logs" / "oauth_state.json")
+        for oauth_state in oauth_candidates:
+            if oauth_state.is_file():
+                try:
+                    state = json.loads(oauth_state.read_text(encoding="utf-8"))
+                    state["tokens"] = {}
+                    state["refresh_tokens"] = {}
+                    tmp_state = oauth_state.with_suffix(".tmp")
+                    tmp_state.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+                    tmp_state.replace(oauth_state)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("failed to clear old oauth tokens during rotation: %s", exc)
 
     return {
         "issued": True,
@@ -1177,8 +1243,8 @@ TOOL_DEFS = [
     {
         "name": "workspace_status",
         "description": (
-            "轻量探活与环境/边界探测工具：返回当前可用执行引擎（powershell/python/bash/pillow）、默认工作区、本会话临时信任目录、"
-            "活跃后台作业、磁盘空间、当前媒体隔离边界声明与自改安全规则。"
+            "轻量探活与环境/边界探测工具：返回当前可用执行引擎（powershell/python/bash/pillow）、默认工作区、全局白名单目录（global_whitelist）、"
+            "本会话临时信任目录、活跃后台作业、磁盘空间、当前媒体隔离边界声明与自改安全规则。"
             + MEDIA_BOUNDARY_NOTICE + " " + ENV_ADAPT_AND_SAFETY_NOTICE
         ),
         "inputSchema": {
@@ -1221,7 +1287,7 @@ TOOL_DEFS = [
     },
     {
         "name": "write_file",
-        "description": "写入或追加内容到 Windows 文件（工作区外触发本地置顶弹窗审批；覆盖前自动生成 .bak 快照；写入后自动执行轻量语法/可选工程检查并结构化回喂）。",
+        "description": "写入或追加内容到 Windows 文件（工作区与全局可写白名单之外触发本地置顶弹窗审批；覆盖前自动生成 .bak 快照；写入后自动执行轻量语法/可选工程检查并结构化回喂）。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1532,16 +1598,17 @@ class McpCore:
         self.cfg = cfg
         self.runner = MultiRunner(cfg)
         self.outbox = OutboxManager(cfg)
-        log_file = Path((cfg.get("log") or {}).get("file") or (HERE / "logs" / "server.log"))
+        self.config_path = Path(config_path) if config_path else (HERE / "config.json")
+        cfg_base = self.config_path.resolve(strict=False).parent
+        log_file = Path((cfg.get("log") or {}).get("file") or (cfg_base / "logs" / "server.log"))
         oauth_state_file = Path((cfg.get("oauth") or {}).get("state_file") or (log_file.parent / "oauth_state.json"))
         perm_store_cfg = str((cfg.get("permissions") or {}).get("store_file") or "").strip()
         perm_store_file = Path(perm_store_cfg) if perm_store_cfg else (log_file.parent / "bridge_permissions.json")
         rules_store_file = log_file.parent / "bridge_rules.json"
         ws_store_file = log_file.parent / "bridge_workspaces.json"
         task_plan_store_file = log_file.parent / "task_plans.json"
-        self.config_path = Path(config_path) if config_path else (HERE / "config.json")
         self.guard = WorkspaceBoundaryGuard(
-            cfg, HERE, approval_cb=approval_cb,
+            cfg, cfg_base, approval_cb=approval_cb,
             protected_write_files=[
                 self.config_path, oauth_state_file, perm_store_file,
                 rules_store_file, ws_store_file, task_plan_store_file,
@@ -1593,6 +1660,26 @@ class McpCore:
         self.started = time.time()
         self.stats = {"requests": 0, "tool_calls": {}}
         self.lock = threading.Lock()
+
+    def persist_config_mutation(self, mutator) -> dict:
+        cfg_path = Path(self.config_path)
+        if not cfg_path.is_file():
+            return self.cfg
+        updated = _sync_config_file(cfg_path, mutator)
+        ws_dir_str = str((updated.get("workspace") or {}).get("default_dir") or "").strip()
+        for ws_cfg in _resolve_synced_config_paths(cfg_path, ws_dir_str):
+            _sync_config_file(ws_cfg, mutator)
+        return updated
+
+    def persist_global_whitelist(self) -> list[dict]:
+        entries = self.guard.export_whitelist_config()
+        self.cfg.setdefault("workspace", {})["extra_allowed_dirs"] = entries
+
+        def update_wl(obj: dict):
+            obj.setdefault("workspace", {})["extra_allowed_dirs"] = entries
+
+        self.persist_config_mutation(update_wl)
+        return self.guard.get_global_whitelist()
 
     def _snapshot_mgr_for(self, active_ws: Path) -> SnapshotManager:
         key = os.path.normcase(str(active_ws))
@@ -1655,6 +1742,7 @@ class McpCore:
                     "需要把网页生成图片/视频/音乐落盘到本机请调 bridge_save_generated_media；"
                     "两者均为异步链路，调用后 Agent 必须立即停止当前回合输出，交由插件完成上传/发送或下载落盘。"
                     "【会话权限边界】当油猴本地桥在线时，各对话窗口权限按会话网页链接独立受控，完全由用户在本地桥面板掌控，不由会话内 Agent 或 Google 掌管。"
+                    "【全局白名单目录】用户可在本地桥维护全局白名单（可通过 workspace_status 的 global_whitelist 查看）；白名单内目录在所有未「禁止」的会话中按其权限（readwrite 自由读写 / readonly 仅只读）直接免审批放行，无需每轮单独向用户确认。"
                     "【动态工作区规则注入】若工作区存在规则文档（AGENTS.md / GEMINI.md / .gemini/rules/*.md），"
                     "服务端会在会话首次调用任意工具、规则文件发生变动、或达到重锚阈值（默认每 20 步调用或累计 48,000 字符工具输出）时，"
                     "自动在工具返回末尾附带 <workspace_rules> 块；收到后请将其视为当前工作区的权威约束执行。 "
@@ -1690,7 +1778,10 @@ class McpCore:
             self.stats["tool_calls"][name] = self.stats["tool_calls"].get(name, 0) + 1
 
         try:
-            auth_info = self.permissions.authorize_tool(name, args, self.bridge)
+            auth_info = self.permissions.authorize_tool(
+                name, args, self.bridge,
+                guard=self.guard, workspace_mgr=self.workspaces,
+            )
             session_key = self.rules.resolve_session_key(auth_info, mcp_session_id)
             active_ws = self.workspaces.resolve_active_dir(auth_info)
             result = self._execute_tool(
@@ -1802,6 +1893,7 @@ class McpCore:
                         "tab_id": auth_info.get("tab_id"),
                     },
                     "extra_allowed_dirs": [str(p) for p in eff_gdirs[1:]],
+                    "global_whitelist": self.guard.get_global_whitelist(),
                     "session_trusted_dirs": self.guard.get_session_trusted(),
                     "active_jobs": self.jobs.list_active(),
                     "disk_free_gb": round(usage.free / (1024 ** 3), 2),
@@ -3079,8 +3171,23 @@ button{{padding:.5rem 1.2rem;font-size:1rem}}</style></head><body>
             if path == "/bridge/workspaces":
                 self._respond_json(200, self.server.core.workspaces.snapshot(self.server.core.bridge))
                 return
+            if path == "/bridge/whitelist":
+                self._respond_json(200, {
+                    "ok": True,
+                    "entries": self.server.core.guard.get_global_whitelist(),
+                    "default_workspace": str(self.server.core.guard.default_dir),
+                })
+                return
             if path == "/bridge/task_plan":
                 self._respond_json(200, self.server.core.task_plans.snapshot(self.server.core.bridge))
+                return
+            if path == "/bridge/public_url":
+                oauth_cfg = self.server.core.cfg.get("oauth") or {}
+                self._respond_json(200, {
+                    "public_base_url": str(oauth_cfg.get("public_base_url") or "").strip(),
+                    "startup_tcp_check": bool(oauth_cfg.get("startup_tcp_check", False)),
+                    "listen_port": int((self.server.core.cfg.get("listen") or {}).get("port") or 15672),
+                })
                 return
             if path == "/bridge/tasks":
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -3163,8 +3270,14 @@ button{{padding:.5rem 1.2rem;font-size:1rem}}</style></head><body>
             if path == "/bridge/workspaces":
                 self._handle_bridge_workspaces_post()
                 return
+            if path == "/bridge/whitelist":
+                self._handle_bridge_whitelist_post()
+                return
             if path == "/bridge/task_plan":
                 self._handle_bridge_task_plan_post()
+                return
+            if path == "/bridge/check_public_url":
+                self._handle_bridge_check_public_url_post()
                 return
             self._respond_json(404, {"error": "not found"})
             return
@@ -3474,6 +3587,83 @@ button{{padding:.5rem 1.2rem;font-size:1rem}}</style></head><body>
         except (ValueError, json.JSONDecodeError) as exc:
             self._respond_json(400, {"error": str(exc)})
 
+    def _handle_bridge_whitelist_post(self):
+        try:
+            payload = json.loads(self._read_body() or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("JSON object expected")
+            action = str(payload.get("action") or "add").strip().lower()
+            core = self.server.core
+            guard = core.guard
+
+            if action == "pick_folder":
+                if not IS_WINDOWS:
+                    raise ValueError("native folder picker is only available on Windows")
+                init_dir = guard.default_dir
+                raw_init = str(payload.get("initial_dir") or "").strip()
+                if raw_init:
+                    cand = resolve_path(raw_init, base_dir=guard.default_dir)
+                    if cand.is_dir():
+                        init_dir = cand
+                chosen = _pick_folder_winforms("选择要加入全局白名单的文件夹（所有非禁止会话可免授权访问）", init_dir)
+                if chosen is None:
+                    self._respond_json(200, {
+                        "ok": True,
+                        "cancelled": True,
+                        "entries": guard.get_global_whitelist(),
+                    })
+                    return
+                entry = guard.add_global_whitelist_dir(
+                    str(chosen),
+                    mode=str(payload.get("mode") or "readwrite"),
+                    allow_exec=bool(payload.get("allow_exec", False)),
+                    label=str(payload.get("label") or ""),
+                )
+                entries = core.persist_global_whitelist()
+                self._respond_json(200, {"ok": True, "cancelled": False, "entry": entry, "entries": entries})
+                return
+
+            if action == "add":
+                raw_path = str(payload.get("path") or "").strip()
+                if not raw_path:
+                    raise ValueError("path is required")
+                entry = guard.add_global_whitelist_dir(
+                    raw_path,
+                    mode=str(payload.get("mode") or "readwrite"),
+                    allow_exec=bool(payload.get("allow_exec", False)),
+                    label=str(payload.get("label") or ""),
+                )
+                entries = core.persist_global_whitelist()
+                self._respond_json(200, {"ok": True, "entry": entry, "entries": entries})
+                return
+
+            if action == "update":
+                raw_path = str(payload.get("path") or "").strip()
+                if not raw_path:
+                    raise ValueError("path is required")
+                entry = guard.update_global_whitelist_dir(
+                    raw_path,
+                    mode=str(payload["mode"]) if "mode" in payload and payload["mode"] is not None else None,
+                    allow_exec=bool(payload["allow_exec"]) if "allow_exec" in payload and payload["allow_exec"] is not None else None,
+                    label=str(payload["label"]) if "label" in payload and payload["label"] is not None else None,
+                )
+                entries = core.persist_global_whitelist()
+                self._respond_json(200, {"ok": True, "entry": entry, "entries": entries})
+                return
+
+            if action == "remove":
+                raw_path = str(payload.get("path") or "").strip()
+                if not raw_path:
+                    raise ValueError("path is required")
+                removed = guard.remove_global_whitelist_dir(raw_path)
+                entries = core.persist_global_whitelist()
+                self._respond_json(200, {"ok": True, "removed": removed, "entries": entries})
+                return
+
+            raise ValueError(f"unsupported action: {action!r}")
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._respond_json(400, {"error": str(exc)})
+
     def _handle_bridge_task_plan_post(self):
         try:
             payload = json.loads(self._read_body() or b"{}")
@@ -3500,6 +3690,50 @@ button{{padding:.5rem 1.2rem;font-size:1rem}}</style></head><body>
                 self._respond_json(200, mgr.get_plan(cid=cid, tab_id=tab_id))
                 return
             raise ValueError(f"unsupported action: {action!r}")
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._respond_json(400, {"error": str(exc)})
+
+    def _handle_bridge_check_public_url_post(self):
+        try:
+            payload = json.loads(self._read_body() or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("JSON object expected")
+            oauth_cfg = self.server.core.cfg.setdefault("oauth", {})
+            raw_url = str(payload.get("public_base_url") or "").strip().rstrip("/")
+            target_url = raw_url or str(oauth_cfg.get("public_base_url") or "").strip().rstrip("/")
+            save = bool(payload.get("save", False))
+            saved = False
+            if save:
+                if raw_url and not raw_url.startswith(("http://", "https://")):
+                    raise ValueError("public_base_url must start with http:// or https://")
+                oauth_cfg["public_base_url"] = raw_url
+                if getattr(self.server, "oauth", None) is not None:
+                    self.server.oauth.configured_base = raw_url
+                def set_pub(obj: dict):
+                    obj.setdefault("oauth", {})["public_base_url"] = raw_url
+                self.server.core.persist_config_mutation(set_pub)
+                saved = True
+                target_url = raw_url
+            if not target_url:
+                self._respond_json(200, {
+                    "ok": True,
+                    "saved": saved,
+                    "public_base_url": "",
+                    "check": {
+                        "status": "empty",
+                        "reason": "未填写公网入口 URL；请先填写公网域名与端口（如 https://example.com:14769）再测试。",
+                        "reachable_families": [],
+                        "families": {},
+                    },
+                })
+                return
+            chk = verify_public_tcp_reachability(target_url)
+            self._respond_json(200, {
+                "ok": True,
+                "saved": saved,
+                "public_base_url": target_url,
+                "check": chk,
+            })
         except (ValueError, json.JSONDecodeError) as exc:
             self._respond_json(400, {"error": str(exc)})
 
@@ -3622,13 +3856,86 @@ def make_server(cfg, core):
             time.sleep(3)
 
 
+def _print_issued_token_banner(res: dict, cfg_path: Path):
+    cfg_now = load_config(str(cfg_path))
+    ws_dir = str((cfg_now.get("workspace") or {}).get("default_dir") or _default_clean_workspace_dir())
+    mcp_dir = _resolve_mcp_runtime_dir(Path(ws_dir)) if (cfg_now.get("workspace") or {}).get("default_dir") else HERE
+    if not (mcp_dir / "server.py").is_file():
+        mcp_dir = Path(ws_dir) if (Path(ws_dir) / "server.py").is_file() else HERE
+    port_now = int((cfg_now.get("listen") or {}).get("port") or 15672)
+    ws_cfg_path = mcp_dir / "config.json"
+    print("\n" + "=" * 72)
+    print("【请立即复制并保存你的本地鉴权 Token（仅首次生成/轮换时明文打印）】")
+    print(f"  鉴权 Token : {res['token']}")
+    print(f"  同步已写入 : {ws_cfg_path}")
+    print("  保存提示   : 连接 Google OAuth 授权页、Bearer 鉴权与油猴脚本都需要使用该 Token，请妥善保存切勿泄露。")
+    print("=" * 72)
+    print("\n已在本地派发鉴权 token。下一步：")
+    print(f"1. 后续从安装目录启动服务：python \"{mcp_dir / 'server.py'}\"")
+    print("2. 连接 Google / Gemini MCP 时，将该 token 作为 Bearer Token 或 OAuth 授权页口令。")
+    print(
+        f"3. 【推荐】安装油猴桥接脚本实现按会话链接细化权限（未装时默认兜底）：\n"
+        f"   http://127.0.0.1:{port_now}/bridge/pc-work-mcp-gemini.user.js?token={res['token']}"
+    )
+    print("   （授权规则基于各自会话链接，由本地桥直接掌控，不由会话内 Agent 或 Google 掌管。）")
+
+
+def _prompt_optional_public_url(cfg_path: Path, explicit_url: str | None = None):
+    public_url = (explicit_url or "").strip().rstrip("/")
+    if not public_url and sys.stdin.isatty():
+        cur_cfg = load_config(str(cfg_path))
+        if not str((cur_cfg.get("oauth") or {}).get("public_base_url") or "").strip():
+            try:
+                entered = input(
+                    "[可选] 若已配置公网反代域名连接 Google MCP，请输入公网入口 URL（如 https://example.com:14769，尚无或仅本机请回车）："
+                ).strip().rstrip("/")
+                if entered:
+                    public_url = entered
+            except (EOFError, KeyboardInterrupt):
+                pass
+    if public_url:
+        def set_pub(obj: dict):
+            obj.setdefault("oauth", {})["public_base_url"] = public_url
+        updated = _sync_config_file(cfg_path, set_pub)
+        ws_dir_str = str((updated.get("workspace") or {}).get("default_dir") or "").strip()
+        for ws_cfg in _resolve_synced_config_paths(cfg_path, ws_dir_str):
+            _sync_config_file(ws_cfg, set_pub)
+
+
+def _run_interactive_token_wizard(cfg_path: Path, effective_cfg_path: Path) -> bool:
+    """双击或交互终端直接运行 server.py 且尚未派发 Token 时，引导一键派发并等待确认后继续启动服务。"""
+    print("\n[首次启动向导] 检测到尚未在本地派发鉴权 Token（连接 Google 服务前必须先完成本地派发）。")
+    try:
+        ans = input("是否现在自动生成并保存本机鉴权 Token？[Y/n]（直接回车生成，输入 n 退出）: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if ans in ("n", "no"):
+        return False
+    _prompt_optional_public_url(cfg_path)
+    res = issue_local_token(cfg_path, rotate=False)
+    if effective_cfg_path.resolve(strict=False) != cfg_path.resolve(strict=False) and res.get("issued"):
+        def sync_tok(obj: dict):
+            a = obj.setdefault("auth", {})
+            a["enabled"] = True
+            a["token"] = res["token"]
+        _sync_config_file(effective_cfg_path, sync_tok)
+    if res.get("issued"):
+        _print_issued_token_banner(res, effective_cfg_path)
+    try:
+        go = input("\n请确认已复制保存上述 Token，按回车键立即启动 MCP 服务（输入 q 暂不启动并退出）: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return go not in ("q", "quit", "exit")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="pc-work-mcp —— Windows 本机工作台 MCP 服务")
-    parser.add_argument("--config", default=str(HERE / "config.json"))
+    parser.add_argument("--config", default=None, help="指定配置文件路径（默认读取同目录 config.json）")
     parser.add_argument("--port", type=int, default=None, help="覆盖 listen.port")
     parser.add_argument("--token", default=None, help="覆盖 auth.token")
     parser.add_argument("--public-url", default=None, help="设置或覆盖 oauth.public_base_url（反代/隧道公网地址，如 https://domain:14769）")
     parser.add_argument("--workspace", default=None, help="指定工作区目录（首次运行时跳过交互选择）")
+    parser.add_argument("--use-desktop-workspace", action="store_true", help="显式在当前用户桌面创建 pc-work-mcp-workspace 作为首次工作区")
     parser.add_argument("--no-gui", action="store_true", help="首次选择工作区时不弹出 Windows 文件夹选择框")
     parser.add_argument("--issue-token", action="store_true", help="在本地派发并保存鉴权 token（连接 Google 服务前必须执行）")
     parser.add_argument("--rotate-token", action="store_true", help="重新派发新的鉴权 token 并作废旧 OAuth 会话")
@@ -3638,71 +3945,56 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="打印配置后退出")
     args = parser.parse_args(argv)
 
-    cfg_path = Path(args.config)
+    using_default_config = (args.config is None)
+    cfg_path = Path(args.config) if args.config else (HERE / "config.json")
+    tty_interactive = sys.stdin.isatty()
+    effective_cfg_path = cfg_path
+
+    def pause_if_double_clicked():
+        if using_default_config and tty_interactive:
+            try:
+                input("按回车键退出...")
+            except (EOFError, KeyboardInterrupt):
+                pass
+
     if not args.dry_run and not args.token_status and args.check_public_url is None:
-        ws_init = ensure_first_run_workspace(
-            cfg_path,
-            requested_workspace=args.workspace,
-            interactive=sys.stdin.isatty(),
-            use_gui=not args.no_gui,
-        )
+        try:
+            ws_init = ensure_first_run_workspace(
+                cfg_path,
+                requested_workspace=args.workspace,
+                interactive=tty_interactive,
+                use_gui=not args.no_gui,
+                allow_gui=not args.no_gui,
+                use_desktop_workspace=args.use_desktop_workspace,
+            )
+        except WorkspaceSelectionCancelled as exc:
+            print(f"[工作区未初始化] {exc}")
+            pause_if_double_clicked()
+            return 2
         if ws_init.get("initialized_now"):
             print(
-                f"[工作区已初始化] 模式={ws_init['mode']} | 路径={ws_init['workspace_dir']} "
-                f"| 已一次性复制 {ws_init['copied_count']} 个文件到工作区"
+                f"[工作区已初始化] 模式={ws_init['mode']} | 工作区={ws_init['workspace_dir']} "
+                f"| MCP 安装目录={ws_init.get('mcp_dir', ws_init['workspace_dir'])} "
+                f"| 已一次性复制 {ws_init['copied_count']} 个文件"
             )
             print("\n" + PER_CONVERSATION_GUIDE_NOTICE + "\n")
+            if using_default_config and ws_init.get("mcp_dir"):
+                cand_cfg = Path(ws_init["mcp_dir"]) / "config.json"
+                if cand_cfg.is_file():
+                    effective_cfg_path = cand_cfg
 
     if args.issue_token or args.rotate_token:
-        public_url = (args.public_url or "").strip().rstrip("/")
-        if not public_url and sys.stdin.isatty():
-            cur_cfg = load_config(str(cfg_path))
-            if not str((cur_cfg.get("oauth") or {}).get("public_base_url") or "").strip():
-                try:
-                    entered = input(
-                        "[可选] 若通过反代/公网连接 Google MCP，请输入公网入口 URL（如 https://example.com:14769，仅本机请回车）："
-                    ).strip().rstrip("/")
-                    if entered:
-                        public_url = entered
-                except (EOFError, KeyboardInterrupt):
-                    pass
-        if public_url:
-            def set_pub(obj: dict):
-                obj.setdefault("oauth", {})["public_base_url"] = public_url
-            updated = _sync_config_file(cfg_path, set_pub)
-            ws_dir_str = str((updated.get("workspace") or {}).get("default_dir") or "").strip()
-            if ws_dir_str:
-                ws_cfg = Path(ws_dir_str) / "config.json"
-                if ws_cfg.is_file() and ws_cfg.resolve(strict=False) != cfg_path.resolve(strict=False):
-                    _sync_config_file(ws_cfg, set_pub)
-
+        _prompt_optional_public_url(cfg_path, args.public_url)
         res = issue_local_token(cfg_path, rotate=args.rotate_token)
         print(json.dumps(res, ensure_ascii=False, indent=2))
         if res.get("issued"):
-            cfg_now = load_config(str(cfg_path))
-            ws_dir = str((cfg_now.get("workspace") or {}).get("default_dir") or HERE)
-            port_now = int((cfg_now.get("listen") or {}).get("port") or 15672)
-            ws_cfg_path = Path(ws_dir) / "config.json"
-            print("\n" + "=" * 72)
-            print("【请立即复制并保存你的本地鉴权 Token（仅首次生成/轮换时明文打印）】")
-            print(f"  鉴权 Token : {res['token']}")
-            print(f"  同步已写入 : {ws_cfg_path}")
-            print("  保存提示   : 连接 Google OAuth 授权页、Bearer 鉴权与油猴脚本都需要使用该 Token，请妥善保存切勿泄露。")
-            print("=" * 72)
-            print("\n已在本地派发鉴权 token。下一步：")
-            print(f"1. 从工作区启动服务：python \"{Path(ws_dir) / 'server.py'}\"")
-            print("2. 连接 Google / Gemini MCP 时，将该 token 作为 Bearer Token 或 OAuth 授权页口令。")
-            print(
-                f"3. 【推荐】安装油猴桥接脚本实现按会话链接细化权限（未装时默认兜底）：\n"
-                f"   http://127.0.0.1:{port_now}/bridge/pc-work-mcp-gemini.user.js?token={res['token']}"
-            )
-            print("   （授权规则基于各自会话链接，由本地桥直接掌控，不由会话内 Agent 或 Google 掌管。）")
+            _print_issued_token_banner(res, cfg_path)
         else:
             print("\n已存在本地鉴权 token；如需轮换并作废旧会话，请加 --rotate-token。")
-            print("（如忘记完整 token，可打开工作区 config.json 查看 auth.token 字段，或运行 --rotate-token 重新生成。）")
+            print("（如忘记完整 token，可打开 Gemini-Windows-Mcp\\config.json 查看 auth.token 字段，或运行 --rotate-token 重新生成。）")
         return 0
 
-    cfg = load_config(args.config)
+    cfg = load_config(str(effective_cfg_path))
     if args.port:
         cfg["listen"]["port"] = args.port
     if args.token:
@@ -3716,7 +4008,7 @@ def main(argv=None):
             "auth_enabled": bool((cfg.get("auth") or {}).get("enabled", True)),
             "token_issued": bool(tok),
             "masked_token": mask_token(tok),
-            "config_path": str(cfg_path),
+            "config_path": str(effective_cfg_path),
         }, ensure_ascii=False, indent=2))
         return 0
 
@@ -3726,29 +4018,42 @@ def main(argv=None):
         print(json.dumps(chk, ensure_ascii=False, indent=2))
         return 2 if chk.get("status") == "unreachable" else 0
 
+    if not is_local_token_configured(cfg):
+        if using_default_config and tty_interactive:
+            if not _run_interactive_token_wizard(cfg_path, effective_cfg_path):
+                print("已退出；待需要连接时可随时双击运行或执行 python server.py --issue-token。")
+                return 2
+            cfg = load_config(str(effective_cfg_path))
+            if args.port:
+                cfg["listen"]["port"] = args.port
+            if args.public_url:
+                cfg.setdefault("oauth", {})["public_base_url"] = args.public_url.strip().rstrip("/")
+        else:
+            setup_logging(cfg)
+            LOG.info("starting %s %s (config=%s)", SERVER_NAME, SERVER_VERSION, effective_cfg_path)
+            LOG.error(
+                "auth.enabled=true but auth.token is empty —— 拒绝启动。"
+                "在连接 Google 服务前，请先在本地运行: python \"%s\" --issue-token --config \"%s\"",
+                Path(__file__).name,
+                effective_cfg_path,
+            )
+            return 2
+
     setup_logging(cfg)
-    LOG.info("starting %s %s (config=%s)", SERVER_NAME, SERVER_VERSION, args.config)
+    LOG.info("starting %s %s (config=%s)", SERVER_NAME, SERVER_VERSION, effective_cfg_path)
 
     if args.dry_run:
         print(json.dumps(cfg, indent=2, ensure_ascii=False))
         return 0
 
-    if not is_local_token_configured(cfg):
-        LOG.error(
-            "auth.enabled=true but auth.token is empty —— 拒绝启动。"
-            "在连接 Google 服务前，请先在本地运行: python \"%s\" --issue-token --config \"%s\"",
-            Path(__file__).name,
-            cfg_path,
-        )
-        return 2
-
     if (cfg.get("oauth") or {}).get("enabled", True) and not str((cfg.get("oauth") or {}).get("public_base_url") or "").strip():
-        LOG.warning(
-            "oauth.public_base_url 为空：若反向代理（如 lucky）改写了 Host 头，Google OAuth 自动注册可能会拿到内网地址并失败。"
-            "建议在 config.json 填写 oauth.public_base_url 或启动时传 --public-url https://你的域名:端口"
+        LOG.info(
+            "oauth.public_base_url 尚未填写（本机/局域网与油猴桥可先正常运行）。"
+            "【重要提醒】在设置 Google / Gemini MCP 服务前，请先完成公网反代/端口映射，"
+            "并在油猴控制面板内填写域名后点击「测试公网连通性 (双栈 TCP)」确认外网能连入本机。"
         )
 
-    core = McpCore(cfg, config_path=args.config)
+    core = McpCore(cfg, config_path=str(effective_cfg_path))
     server, host, port = make_server(cfg, core)
 
     def shutdown(signum, frame):  # noqa: ARG001
@@ -3770,7 +4075,7 @@ def main(argv=None):
 
     oauth_cfg = cfg.get("oauth") or {}
     pub_url = str(oauth_cfg.get("public_base_url") or "").strip()
-    if oauth_cfg.get("enabled", True) and pub_url and oauth_cfg.get("startup_tcp_check", True) and not args.skip_tcp_check:
+    if oauth_cfg.get("enabled", True) and pub_url and oauth_cfg.get("startup_tcp_check", False) and not args.skip_tcp_check:
         LOG.info("正在执行公网入口外网双栈 TCP 自检: %s", pub_url)
         chk = verify_public_tcp_reachability(pub_url)
         fam = chk.get("families") or {}
@@ -3804,6 +4109,12 @@ def main(argv=None):
             server.shutdown()
             server.server_close()
             return 2
+    elif oauth_cfg.get("enabled", True) and pub_url:
+        LOG.info(
+            "【重要提醒】在设置 Google / Gemini MCP 服务前，请在油猴面板点击「测试公网连通性 (双栈 TCP)」"
+            "或运行 python server.py --check-public-url 确认 %s 从外网确实能连入本机。",
+            pub_url,
+        )
 
     LOG.info(PER_CONVERSATION_GUIDE_NOTICE)
     try:

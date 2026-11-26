@@ -1,11 +1,11 @@
-# pc-work-mcp · Windows 本机工作台 MCP 服务（分发版）（略有小坑打磨中）
+# pc-work-mcp · Windows 本机工作台 MCP 服务（分发版）
 
 一个纯粹、可自举的 Windows 本机工作台 MCP 服务：
 
 - **零第三方强制依赖**：服务端本体仅使用 Python 标准库，解压即可运行。
 - **原生只读检索与写后轻量校验**：内置纯标准库 `find_files` / `grep_search`（无需消耗 `exec` 权限）；`write_file` / `edit_file` 自动执行瞬时语法检查与可选工程 `lint/test` 命令并结构化回喂，充分利用网页端受限的单轮执行步数。
 - **轻量任务计划与受控自唤醒（`task_plan`）**：持久化当前会话的任务步骤与自动续跑次数上限，配合油猴桥接在停稳冷却+随机抖动后自动唤醒下一回合继续完善目标；提示词强制极简交接（≤120 字）防上下文膨胀，油猴端随时可一键暂停。
-- **首次工作区自举**：首次运行强制要求选择工作区（取消/留空则在当前用户桌面创建 `pc-work-mcp-workspace`），并把全套源码、配置、文档与测试一次性复制到工作区内，方便后续由用户或 Agent 扩展。
+- **首次工作区自举**：首次运行弹出工作区选择框（取消即中止初始化，不会乱建桌面目录；若已置于 `<工作区>\Gemini-Windows-Mcp\` 子目录下则自动回退到外层干净工作区，也可用 `--use-desktop-workspace` 显式建在桌面），并把全套源码、配置、文档与测试一次性放到工作区的 `Gemini-Windows-Mcp\` 子目录下，工作区根目录保持洁净。
 - **连接前强制本地鉴权**：必须先在本地派发 `auth.token` 后才能启动服务或响应 OAuth / Google 连接。
 - **透明的媒体边界与动态探针**：在 MCP `instructions` 与工具提示词中明确当前网关/沙箱边界缺陷，并附带 1×1 像素探测图以感知上游限制是否松动。
 - **按需动态工作区提示词注入（`workspace_rules`）**：无需依赖容易因 Google 前端变更而失效的发包劫持，自动扫描工作区 `AGENTS.md`、`GEMINI.md`、`.gemini/rules/*.md` 并计算 SHA-256——仅在会话**首次调用任意工具**、**规则文档发生修改/增删**、或长上下文下达到重锚阈值（默认每 **20 步**工具调用或累计 **48,000 字符**工具输出，先到先触发）时，将最新 `<workspace_rules>` 块附带在工具返回尾部以对抗网页随机压缩与长程注意力衰减。
@@ -35,7 +35,7 @@
 
 ### 第一步：首次初始化工作区 + 本地派发鉴权 Token
 
-`config.json` 默认不包含 `auth.token` 与工作区路径。在启动服务或连接 Google 服务前，**必须先在本地执行**：
+`config.json` 默认不包含 `auth.token` 与工作区路径。你可以直接**双击 `server.py`（或执行 `python server.py`）进入向导**，也可手动执行命令行：
 
 ```powershell
 python server.py --issue-token --public-url "https://你的公网域名:端口"
@@ -43,15 +43,19 @@ python server.py --issue-token --public-url "https://你的公网域名:端口"
 
 （若仅本机调试可省略 `--public-url`；若经 `lucky` 等反向代理连接 Google MCP，建议务必填写 `oauth.public_base_url` 或传 `--public-url`，防止代理改写 `Host` 头导致 Google OAuth 自动注册拿到内网 IP 而失败。）
 
-该命令会按顺序完成两件事：
-1. **选择并初始化工作区**：弹出 Windows 文件夹选择框（也可用 `--workspace "D:\MyWorkspace"` 指定，或 `--no-gui` 走命令行输入）；若取消/留空或非交互运行，则在**当前用户桌面**创建 `pc-work-mcp-workspace`，并把全部源码、配置、文档与测试一次性复制到工作区内。
-2. **派发本地鉴权 Token**：生成高强度随机 token（`pcmcp_...`），同步写入源目录与工作区内的 `config.json`，并在命令行明文打印该 Token 与保存提示（请立即复制保存）。
+向导或上述命令会按顺序完成两件事：
+1. **选择并初始化工作区**：弹出 Windows 文件夹选择框（即使通过 `.vbs` / 无控制台窗口启动也会正常弹出；也可用 `--workspace "D:\MyWorkspace"` 指定，或 `--no-gui` 走命令行输入）。
+   - 如果在弹窗中点击**「取消」**：会直接中止初始化并退出，不会私自在桌面新建目录或复制文件；
+   - 如果你已把程序目录整理进 `<工作区>\Gemini-Windows-Mcp\`，未另选目录时会自动回退到外层干净工作区；
+   - 如确需建在当前桌面 `pc-work-mcp-workspace`，可显式加参数 `--use-desktop-workspace`。
+   - 为保持工作区根目录洁净，全部 MCP 源码、配置、文档与测试统一保存在工作区内的 `Gemini-Windows-Mcp\` 子目录中。
+2. **派发本地鉴权 Token**：生成高强度随机 token（`pcmcp_...`），同步写入源目录与 `<工作区>\Gemini-Windows-Mcp\config.json`，并在终端**明文打印 Token 与复制保存提示**；若是双击/交互运行 `server.py` 触发的向导，回车确认已保存后即可直接继续启动服务（不会闪退）。
 
 常用辅助命令：
 - 查看当前 token 状态（脱敏）：`python server.py --token-status`
 - 轮换 token 并作废旧 OAuth 会话：`python server.py --rotate-token`
 
-> 若未先派发本地 token 直接运行 `server.py`，服务会拒绝启动（退出码 `2`），且 `/register`、`/authorize`、`/token` 等 OAuth 端点会返回 `403 local_token_not_issued`。
+> 若非交互/指定 `--config` 启动且未先派发本地 token，服务会严格拒绝启动（退出码 `2`），且 `/register`、`/authorize`、`/token` 等 OAuth 端点会返回 `403 local_token_not_issued`。
 
 ### 第二步：放行 Windows 入站防火墙（跨主机反代/局域网访问必做）
 
@@ -69,13 +73,13 @@ powershell -ExecutionPolicy Bypass -File ".\admin\add-firewall.ps1"
 
 ### 第三步：启动服务并连接
 
-建议直接从已复制好的工作区目录启动：
+建议直接从工作区内已整理好的 `Gemini-Windows-Mcp` 子目录启动：
 
 ```powershell
-python "<你的工作区路径>\server.py"
+python "<你的工作区路径>\Gemini-Windows-Mcp\server.py"
 ```
 
-- **外网双栈 TCP 自检锁**：若配置了 `oauth.public_base_url`，服务在监听端口后会自动调用外部在线双栈探针（兼容纯 IPv6 宽带、IPv4 与中国大陆直连环境，不依赖 ICMP ping）检测外网能否连入该域名/端口；若外网确实不通，启动日志会直接报 `[自检锁拦截]` 并退出，避免白连 Google。若需跳过检查，可传 `--skip-tcp-check` 或在 `config.json` 将 `oauth.startup_tcp_check` 设为 `false`；也可单独运行 `python server.py --check-public-url` 随时自检。
+- **公网连通性按需自检（不阻断默认启动）**：`oauth.startup_tcp_check` 默认为 `false`，确保在尚未配置公网域名或反代时双击/直接启动 `server.py` 也能正常运行；待你配置好域名和反代后，**在设置 Google / Gemini MCP 服务前**，强烈建议直接在**油猴面板点击「🌐 测试外网双栈 TCP 连通性」**（或运行 `python server.py --check-public-url`）确认外网 IPv6 / IPv4 确实能连入本机。若希望每次启动自动强检，可在 `config.json` 将 `oauth.startup_tcp_check` 设为 `true`。
 - 连接 Google / Gemini 自定义 MCP 时，使用本地派发的 token 作为 Bearer Token 或 `/authorize` 授权页的访问口令。
 
 ---
@@ -117,6 +121,10 @@ python "<你的工作区路径>\server.py"
    - **按会话选择与切换工作区目录（与默认工作区逻辑完全一致）**：
      - 可在油猴弹窗中点击「本机选文件夹并绑定」触发 Windows 原生目录选择器，或直接粘贴目录路径保存为常用工作区清单并绑定到当前 Gemini 会话链接（同样支持首轮 `/app` 提前绑定并在生成首条回复后自动转绑到 `/app/<id>`）；
      - 一旦某个会话绑定了切换目录，该会话内所有相对路径（`read_file`/`write_file`/`edit_file`/`list_dir`/`push_file`）、绿区写入边界、命令默认 `cwd`、`.mcp_snapshots/` 备份、`.tmp_outputs/` 大输出旁路、以及 `AGENTS.md` 规则探测都自动切换至该目录并保持与默认工作区完全一致的行为（同时写回原默认工作区或控制面文件仍受边界拦截）；点击「恢复默认工作区」即可随时切回。
+   - **全局白名单目录（跨会话免重复授权，如本地日记本/知识库）**：
+     - 若某个本地文件夹（例如个人日记本、笔记库）需要几乎所有新对话都能随时读写，可在油猴弹窗「全局白名单目录」中通过系统选目录或粘贴路径直接添加（持久化至 `config.json` 的 `workspace.extra_allowed_dirs` 并即时热生效，无需重启服务）。
+     - 白名单内目录在**所有未设为「禁止 (deny)」的会话**中对文件/目录/检索/媒体工具直接免审批放行，不再每轮弹窗或要求切换整套会话档位；支持每条目录单独切换 **`自由读写 (readwrite)`** / **`仅只读 (readonly)`**，以及可选勾选 **`允许以该目录为 cwd 免批执行脚本`**（默认关闭以保持安全），同时系统保留目录（`System32` 等）与 MCP 控制面文件（`config.json`、`bridge_*.json` 等）依然受严格保护。
+     - Agent 可通过 `workspace_status` 返回的 `global_whitelist` 字段直接知悉这些目录与权限模式。
    - **读图 / 读视频自动上传并发送（`bridge_upload_media`）**：Agent 调用后**必须立即停止当前回合输出**；油猴会定位或打开对应 `conversation_id` 会话、注入本地媒体、监听上传进度与 `push.clients6.google.com/upload` 彻底完成后自动点击发送。
    - **网页生图 / 视频 / 音乐下载落盘（`bridge_save_generated_media`）**：Agent 传入本机目标目录或路径并停止当前回合输出；油猴在生成完成后于浏览器登录态内提取原图/视频/音乐字节（含 `blob:` 回收时的 Canvas 高清回退）并回传 MCP 写入指定路径（工作区外变更受本地弹窗审批保护）。
    - **受控自唤醒续跑（`task_plan` `schedule_continue`）**：当网页端接近单轮步数上限而任务尚未收口时，模型可写入精简目标/步骤并通过 `schedule_continue` 入队续跑；油猴会在本回合完全停稳、经过最短冷却（≥5s）并叠加随机抖动后自动发送极简自唤醒提示词，同时右下角弹出可随时一键「暂停取消」的倒计时条，并受单计划自动轮数上限（默认 5 轮）熔断保护。

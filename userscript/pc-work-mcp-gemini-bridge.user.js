@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pc-work-mcp Gemini Bridge
 // @namespace    https://pc-work-mcp.local/
-// @version      1.0.0
+// @version      1.1.0
 // @description  连接 Gemini 网页端与本地 pc-work-mcp：实时同步会话 ID（含首轮异步捕获）、监听文件上传完成自动发送、将网页端生成的图片/视频/音乐下载落盘到指定目录。
 // @match        https://gemini.google.com/*
 // @grant        GM_xmlhttpRequest
@@ -1754,6 +1754,207 @@
     }
     wsBox.appendChild(geminiLinksDivider);
 
+    // --- Section 2.6: 全局白名单目录（跨所有非禁止会话免授权自由读写） ---
+    const wlBox = document.createElement('div');
+    Object.assign(wlBox.style, {
+      background: '#111214',
+      borderRadius: '8px',
+      padding: '10px',
+      marginBottom: '8px',
+      fontSize: '12px',
+    });
+
+    const wlInfoMsg = document.createElement('div');
+    wlInfoMsg.textContent =
+      '填入此处的文件夹（如日记本、知识库）在所有未设为「禁止」的会话中均可直接自由读取/写入，无需每次开新对话重复授权，也不会触发工作区外弹窗（即时热生效）。';
+    Object.assign(wlInfoMsg.style, { color: '#a1a1aa', lineHeight: '1.5', fontSize: '11px', marginBottom: '8px' });
+
+    const wlListEl = document.createElement('div');
+    Object.assign(wlListEl.style, {
+      maxHeight: '140px',
+      overflowY: 'auto',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '5px',
+      marginBottom: '8px',
+    });
+
+    const inpWlDir = document.createElement('input');
+    inpWlDir.type = 'text';
+    inpWlDir.placeholder = '输入或粘贴全局白名单文件夹路径（如 D:\\MyDiary，支持带引号复制路径）';
+    Object.assign(inpWlDir.style, {
+      width: '100%',
+      boxSizing: 'border-box',
+      padding: '7px 8px',
+      borderRadius: '6px',
+      border: '1px solid #3f3f46',
+      background: '#18181b',
+      color: '#fafafa',
+      fontSize: '12px',
+      marginBottom: '6px',
+    });
+
+    const wlOptsRow = document.createElement('div');
+    Object.assign(wlOptsRow.style, {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: '12px',
+      marginBottom: '8px',
+      fontSize: '11px',
+      color: '#d4d4d8',
+    });
+
+    const lblWlReadonly = document.createElement('label');
+    Object.assign(lblWlReadonly.style, { display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer' });
+    const chkWlReadonly = document.createElement('input');
+    chkWlReadonly.type = 'checkbox';
+    const txtWlReadonly = document.createElement('span');
+    txtWlReadonly.textContent = '仅只读（允许自由读取，禁止写入）';
+    lblWlReadonly.appendChild(chkWlReadonly);
+    lblWlReadonly.appendChild(txtWlReadonly);
+
+    const lblWlExec = document.createElement('label');
+    Object.assign(lblWlExec.style, { display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer' });
+    const chkWlExec = document.createElement('input');
+    chkWlExec.type = 'checkbox';
+    const txtWlExec = document.createElement('span');
+    txtWlExec.textContent = '允许以该目录为 cwd 免批执行脚本';
+    lblWlExec.appendChild(chkWlExec);
+    lblWlExec.appendChild(txtWlExec);
+
+    chkWlReadonly.addEventListener('change', () => {
+      if (chkWlReadonly.checked) {
+        chkWlExec.checked = false;
+        chkWlExec.disabled = true;
+      } else {
+        chkWlExec.disabled = false;
+      }
+    });
+    wlOptsRow.appendChild(lblWlReadonly);
+    wlOptsRow.appendChild(lblWlExec);
+
+    const wlBtnRow = document.createElement('div');
+    Object.assign(wlBtnRow.style, { display: 'flex', gap: '6px', flexWrap: 'wrap' });
+    const btnPickWlFolder = mkSmallBtn('📂 本机选文件夹加入白名单', '#059669');
+    const btnAddWl = mkSmallBtn('➕ 添加路径到白名单', '#2563eb');
+    wlBtnRow.appendChild(btnPickWlFolder);
+    wlBtnRow.appendChild(btnAddWl);
+
+    wlBox.appendChild(wlInfoMsg);
+    wlBox.appendChild(wlListEl);
+    wlBox.appendChild(inpWlDir);
+    wlBox.appendChild(wlOptsRow);
+    wlBox.appendChild(wlBtnRow);
+
+    // 公网入口外网双栈 TCP 自检区（默认启动不卡死；配置好域名/反代后，在接入 Google MCP 前自己测通不通）
+    const pubBox = document.createElement('div');
+    Object.assign(pubBox.style, {
+      border: '1px solid #3f3f46',
+      borderRadius: '8px',
+      padding: '10px',
+      marginBottom: '12px',
+      background: '#111214',
+    });
+    const pubTip = document.createElement('div');
+    pubTip.textContent = '⚠️ 在设置 Google「关联应用 / MCP (connectors)」前，请先测试你的公网入口域名与端口是否真的能从外网连入本机（兼容国内纯 IPv6 宽带 / IPv4）。';
+    Object.assign(pubTip.style, { fontSize: '11px', color: '#fde68a', marginBottom: '8px', lineHeight: '1.5' });
+
+    const inpPubUrl = document.createElement('input');
+    inpPubUrl.type = 'text';
+    inpPubUrl.placeholder = '填写公网入口 URL（如 https://mcp.example.com:14769）';
+    Object.assign(inpPubUrl.style, {
+      width: '100%',
+      boxSizing: 'border-box',
+      padding: '7px 8px',
+      borderRadius: '6px',
+      border: '1px solid #3f3f46',
+      background: '#18181b',
+      color: '#fafafa',
+      fontSize: '12px',
+      marginBottom: '8px',
+    });
+
+    const pubBtnRow = document.createElement('div');
+    Object.assign(pubBtnRow.style, { display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '8px' });
+    const btnTestPub = mkSmallBtn('🌐 测试外网双栈 TCP 连通性', '#2563eb');
+    const btnSaveAndTestPub = mkSmallBtn('💾 保存公网地址到 config 并测试', '#059669');
+    pubBtnRow.appendChild(btnTestPub);
+    pubBtnRow.appendChild(btnSaveAndTestPub);
+
+    const pubStatusMsg = document.createElement('div');
+    pubStatusMsg.textContent = '等待测试（未填写公网域名时仅本机/油猴可用，不影响本地服务启动）。';
+    Object.assign(pubStatusMsg.style, {
+      fontSize: '11px',
+      color: '#a1a1aa',
+      lineHeight: '1.5',
+      whiteSpace: 'pre-wrap',
+      wordBreak: 'break-word',
+    });
+
+    pubBox.appendChild(pubTip);
+    pubBox.appendChild(inpPubUrl);
+    pubBox.appendChild(pubBtnRow);
+    pubBox.appendChild(pubStatusMsg);
+
+    function renderPublicCheckResult(resp) {
+      if (!resp || !resp.check) return;
+      const chk = resp.check;
+      const st = chk.status || 'unknown';
+      const fam = chk.families || {};
+      const v6 = (fam.ipv6 && fam.ipv6.state) || '-';
+      const v4 = (fam.ipv4 && fam.ipv4.state) || '-';
+      const target = (chk.host && chk.port) ? `${chk.host}:${chk.port}` : (resp.public_base_url || '(未填写)');
+      const savedNote = resp.saved ? '（已写入 config.json 并热更新）\n' : '';
+      if (st === 'reachable') {
+        const fams = (chk.reachable_families || []).join('/') || 'TCP';
+        pubStatusMsg.textContent = `${savedNote}✅ 外网 TCP 可达：${target}\n可达协议栈: ${fams}（IPv6=${v6} | IPv4=${v4}）。现在可以放心配置 Google MCP！`;
+        pubStatusMsg.style.color = '#34d399';
+      } else if (st === 'unreachable') {
+        pubStatusMsg.textContent =
+          `${savedNote}❌ 外网不可达：${target}（IPv6=${v6} | IPv4=${v4}）\n` +
+          `此时连接 Google MCP 会失败。请依次排查：\n` +
+          `1) 管理员运行 admin\\add-firewall.ps1 放行端口；\n` +
+          `2) 路由器转发 / lucky 反代是否已启用且绑定当前最新 IPv6 前缀；\n` +
+          `3) 公网域名与端口号是否拼写正确。`;
+        pubStatusMsg.style.color = '#f87171';
+      } else if (st === 'empty') {
+        pubStatusMsg.textContent = `${savedNote}ℹ️ ${chk.reason || '未填写公网入口 URL。'}`;
+        pubStatusMsg.style.color = '#a1a1aa';
+      } else if (st === 'skipped') {
+        pubStatusMsg.textContent = `${savedNote}⚠️ ${target} 为本机/内网地址，已跳过外网探测；接入 Google MCP 需填写公网域名。`;
+        pubStatusMsg.style.color = '#fde68a';
+      } else {
+        pubStatusMsg.textContent = `${savedNote}⚠️ 外部在线探测服务暂不可用（IPv6=${v6} | IPv4=${v4}），请稍后重试或用手机流量验证。`;
+        pubStatusMsg.style.color = '#fde68a';
+      }
+    }
+
+    async function runPublicConnectivityCheck(saveFirst) {
+      btnTestPub.disabled = true;
+      btnSaveAndTestPub.disabled = true;
+      pubStatusMsg.textContent = '正在调用外部双栈 TCP 探针检测（约 2~6 秒）...';
+      pubStatusMsg.style.color = '#93c5fd';
+      try {
+        const res = await mcpJson('POST', '/bridge/check_public_url', {
+          public_base_url: inpPubUrl.value.trim(),
+          save: Boolean(saveFirst),
+        });
+        if (res && res.public_base_url && !inpPubUrl.value.trim()) {
+          inpPubUrl.value = res.public_base_url;
+        }
+        renderPublicCheckResult(res);
+      } catch (err) {
+        pubStatusMsg.textContent = '公网连通性测试失败: ' + String(err && err.message ? err.message : err);
+        pubStatusMsg.style.color = '#f87171';
+      } finally {
+        btnTestPub.disabled = false;
+        btnSaveAndTestPub.disabled = false;
+      }
+    }
+
+    btnTestPub.addEventListener('click', () => runPublicConnectivityCheck(false));
+    btnSaveAndTestPub.addEventListener('click', () => runPublicConnectivityCheck(true));
+
     function renderTaskPlanInfo(plan) {
       currentTaskPlan = plan || null;
       if (!plan) {
@@ -1919,27 +2120,156 @@
       }
     }
 
+    function renderWhitelistPanel(wlSnap) {
+      if (!wlSnap) return;
+      while (wlListEl.firstChild) wlListEl.removeChild(wlListEl.firstChild);
+      const entries = wlSnap.entries || [];
+      if (entries.length === 0) {
+        const emptyWl = document.createElement('div');
+        emptyWl.textContent = '暂无全局白名单目录（可选择或粘贴本机日记本/笔记库路径，跨所有会话免弹窗自由读写）。';
+        emptyWl.style.color = '#71717a';
+        emptyWl.style.fontSize = '11px';
+        wlListEl.appendChild(emptyWl);
+        return;
+      }
+
+      for (const item of entries) {
+        const isRo = item.mode === 'readonly';
+        const allowExec = !isRo && Boolean(item.allow_exec);
+        const row = document.createElement('div');
+        Object.assign(row.style, {
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: '6px',
+          background: '#18181b',
+          border: '1px solid #27272a',
+          padding: '6px 8px',
+          borderRadius: '6px',
+        });
+
+        const left = document.createElement('div');
+        left.style.overflow = 'hidden';
+        left.style.flex = '1';
+        const nameLine = document.createElement('div');
+        nameLine.textContent =
+          `🌐 ${item.label || item.path}` +
+          (isRo ? ' [仅只读]' : ' [自由读写]') +
+          (allowExec ? ' [命令免批]' : '') +
+          (item.exists === false ? ' [目录不存在]' : '');
+        nameLine.style.color = item.exists === false ? '#fca5a5' : (isRo ? '#93c5fd' : '#86efac');
+        nameLine.style.fontWeight = '600';
+        const pathLine = document.createElement('div');
+        pathLine.textContent = item.path;
+        pathLine.style.color = '#a1a1aa';
+        pathLine.style.fontSize = '11px';
+        pathLine.style.whiteSpace = 'nowrap';
+        pathLine.style.overflow = 'hidden';
+        pathLine.style.textOverflow = 'ellipsis';
+        left.appendChild(nameLine);
+        left.appendChild(pathLine);
+
+        const acts = document.createElement('div');
+        acts.style.display = 'flex';
+        acts.style.gap = '4px';
+        acts.style.flexShrink = '0';
+
+        const btnMode = mkSmallBtn(isRo ? '切读写' : '切只读', 'transparent', '1px solid #52525b', '#e4e4e7');
+        btnMode.style.padding = '3px 7px';
+        btnMode.style.fontSize = '11px';
+        btnMode.addEventListener('click', async () => {
+          try {
+            const res = await mcpJson('POST', '/bridge/whitelist', {
+              action: 'update',
+              path: item.path,
+              mode: isRo ? 'readwrite' : 'readonly',
+            });
+            renderWhitelistPanel(res);
+          } catch (err) {
+            wlInfoMsg.textContent = '切换模式失败: ' + String(err && err.message ? err.message : err);
+            wlInfoMsg.style.color = '#f87171';
+          }
+        });
+        acts.appendChild(btnMode);
+
+        if (!isRo) {
+          const btnExec = mkSmallBtn(
+            allowExec ? '命令已免批' : '命令免批',
+            allowExec ? '#78350f' : 'transparent',
+            allowExec ? '1px solid #f59e0b' : '1px solid #52525b',
+            allowExec ? '#fde68a' : '#d4d4d8',
+          );
+          btnExec.style.padding = '3px 7px';
+          btnExec.style.fontSize = '11px';
+          btnExec.title = '允许 cwd 设为该白名单目录的脚本在「按需询问」下免弹窗执行';
+          btnExec.addEventListener('click', async () => {
+            try {
+              const res = await mcpJson('POST', '/bridge/whitelist', {
+                action: 'update',
+                path: item.path,
+                allow_exec: !allowExec,
+              });
+              renderWhitelistPanel(res);
+            } catch (err) {
+              wlInfoMsg.textContent = '更新命令权限失败: ' + String(err && err.message ? err.message : err);
+              wlInfoMsg.style.color = '#f87171';
+            }
+          });
+          acts.appendChild(btnExec);
+        }
+
+        const btnRem = mkSmallBtn('移除', 'transparent', '1px solid #52525b', '#fca5a5');
+        btnRem.style.padding = '3px 7px';
+        btnRem.style.fontSize = '11px';
+        btnRem.addEventListener('click', async () => {
+          try {
+            const res = await mcpJson('POST', '/bridge/whitelist', {
+              action: 'remove',
+              path: item.path,
+            });
+            renderWhitelistPanel(res);
+          } catch (err) {
+            wlInfoMsg.textContent = '移除失败: ' + String(err && err.message ? err.message : err);
+            wlInfoMsg.style.color = '#f87171';
+          }
+        });
+        acts.appendChild(btnRem);
+
+        row.appendChild(left);
+        row.appendChild(acts);
+        wlListEl.appendChild(row);
+      }
+    }
+
     async function refreshPermissionsPanel() {
       if (!getToken()) {
         permStatusMsg.textContent = '请先在下方填写本机派发的 auth.token 后测试连接。';
         return;
       }
       try {
-        const [snap, rulesSnap, wsSnap, planResp] = await Promise.all([
+        const [snap, rulesSnap, wsSnap, wlSnap, planResp, pubResp] = await Promise.all([
           mcpJson('GET', '/bridge/permissions'),
           mcpJson('GET', '/bridge/rules').catch(() => null),
           mcpJson('GET', '/bridge/workspaces').catch(() => null),
+          mcpJson('GET', '/bridge/whitelist').catch(() => null),
           mcpJson('POST', '/bridge/task_plan', {
             action: 'get',
             conversation_id: getConversationId(),
             tab_id: TAB_ID,
           }).catch(() => null),
+          mcpJson('GET', '/bridge/public_url').catch(() => null),
         ]);
+        if (pubResp && typeof pubResp.public_base_url === 'string' && !inpPubUrl.value.trim()) {
+          inpPubUrl.value = pubResp.public_base_url;
+        }
         if (planResp) {
           renderTaskPlanInfo(planResp.plan || null);
         }
         if (wsSnap) {
           renderWorkspacePanel(wsSnap);
+        }
+        if (wlSnap) {
+          renderWhitelistPanel(wlSnap);
         }
         if (rulesSnap && rulesSnap.tab_rules && rulesSnap.tab_rules[TAB_ID]) {
           renderRulesInfo(rulesSnap.tab_rules[TAB_ID]);
@@ -2224,14 +2554,62 @@
       }
     });
 
+    btnPickWlFolder.addEventListener('click', async () => {
+      btnPickWlFolder.disabled = true;
+      btnPickWlFolder.textContent = '请在系统弹窗选择文件夹...';
+      try {
+        const res = await mcpJson('POST', '/bridge/whitelist', {
+          action: 'pick_folder',
+          mode: chkWlReadonly.checked ? 'readonly' : 'readwrite',
+          allow_exec: !chkWlReadonly.checked && chkWlExec.checked,
+          initial_dir: (currentWorkspace && currentWorkspace.workspace_dir) || '',
+        });
+        if (res && !res.cancelled) {
+          renderWhitelistPanel(res);
+          wlInfoMsg.textContent = '✅ 已添加到全局白名单（即时对所有非禁止会话生效）。';
+          wlInfoMsg.style.color = '#34d399';
+        }
+      } catch (err) {
+        wlInfoMsg.textContent = '弹窗加入白名单失败: ' + String(err && err.message ? err.message : err);
+        wlInfoMsg.style.color = '#f87171';
+      } finally {
+        btnPickWlFolder.disabled = false;
+        btnPickWlFolder.textContent = '📂 本机选文件夹加入白名单';
+      }
+    });
+
+    btnAddWl.addEventListener('click', async () => {
+      try {
+        const dir = inpWlDir.value.trim();
+        if (!dir) throw new Error('请输入要加入全局白名单的文件夹路径');
+        const res = await mcpJson('POST', '/bridge/whitelist', {
+          action: 'add',
+          path: dir,
+          mode: chkWlReadonly.checked ? 'readonly' : 'readwrite',
+          allow_exec: !chkWlReadonly.checked && chkWlExec.checked,
+        });
+        inpWlDir.value = '';
+        renderWhitelistPanel(res);
+        wlInfoMsg.textContent = '✅ 已添加到全局白名单（即时对所有非禁止会话生效）。';
+        wlInfoMsg.style.color = '#34d399';
+      } catch (err) {
+        wlInfoMsg.textContent = '添加全局白名单失败: ' + String(err && err.message ? err.message : err);
+        wlInfoMsg.style.color = '#f87171';
+      }
+    });
+
     card.appendChild(h3);
     card.appendChild(info);
     card.appendChild(makeSectionTitle('当前窗口工作区目录（独立切换与规则同步）'));
     card.appendChild(wsBox);
+    card.appendChild(makeSectionTitle('全局白名单目录（跨所有非禁止会话免授权自由读写）'));
+    card.appendChild(wlBox);
     card.appendChild(makeSectionTitle('当前窗口权限档位（基于本会话链接）'));
     card.appendChild(permBox);
     card.appendChild(makeSectionTitle('已授权的会话链接清单'));
     card.appendChild(savedListEl);
+    card.appendChild(makeSectionTitle('公网入口连通性自检（配置 Google MCP 前必测）'));
+    card.appendChild(pubBox);
     card.appendChild(makeSectionTitle('本地桥接连接配置'));
     card.appendChild(fUrl.wrap);
     card.appendChild(fTok.wrap);

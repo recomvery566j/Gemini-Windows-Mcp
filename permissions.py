@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from security import PermissionDeniedByUser
+from security import PermissionDeniedByUser, resolve_path
 
 LOG = logging.getLogger("pc-work-mcp.permissions")
 
@@ -500,11 +500,88 @@ class ConversationPermissionManager:
             )
         return pub
 
+    def _is_global_whitelist_allowed(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        guard,
+        active_ws: Path | None,
+    ) -> bool:
+        if guard is None:
+            return False
+        a = args or {}
+
+        if tool_name in ("read_file", "read_image", "list_dir"):
+            raw_path = str(a.get("path") or "").strip()
+            return bool(raw_path) and guard.is_whitelisted_for_action(
+                raw_path, access="read", active_workspace=active_ws,
+            )
+
+        if tool_name in ("find_files", "grep_search"):
+            raw_path = str(a.get("path") or "").strip()
+            if not raw_path or raw_path == ".":
+                return False
+            return guard.is_whitelisted_for_action(
+                raw_path, access="read", active_workspace=active_ws,
+            )
+
+        if tool_name == "bridge_upload_media":
+            raw_files = a.get("files") or []
+            if isinstance(raw_files, str):
+                raw_files = [raw_files]
+            if not isinstance(raw_files, list) or not raw_files:
+                return False
+            cleaned = [str(item).strip() for item in raw_files if isinstance(item, str) and item.strip()]
+            if not cleaned:
+                return False
+            return all(
+                guard.is_whitelisted_for_action(p, access="read", active_workspace=active_ws)
+                for p in cleaned
+            )
+
+        if tool_name in ("write_file", "edit_file", "push_file"):
+            raw_path = str(a.get("path") or "").strip()
+            return bool(raw_path) and guard.is_whitelisted_for_action(
+                raw_path, access="write", active_workspace=active_ws,
+            )
+
+        if tool_name == "bridge_save_generated_media":
+            raw_target = str(a.get("target_path") or "").strip()
+            if not raw_target:
+                return False
+            norm_target = resolve_path(raw_target, base_dir=active_ws)
+            is_dir = raw_target.endswith(("/", "\\")) or norm_target.is_dir() or not norm_target.suffix
+            probe_path = str(norm_target / "__artifact__") if is_dir else str(norm_target)
+            return guard.is_whitelisted_for_action(
+                probe_path, access="write", active_workspace=active_ws,
+            )
+
+        if tool_name in ("powershell", "python", "bash", "start_job"):
+            raw_cwd = str(a.get("cwd") or "").strip()
+            if not raw_cwd:
+                return False
+            if not guard.is_whitelisted_for_action(raw_cwd, access="exec", active_workspace=active_ws):
+                return False
+            code = str(a.get("script") if tool_name in ("powershell", "bash") else a.get("code") or "")
+            if guard.has_protected_write_reference(code):
+                return False
+            workdir = resolve_path(raw_cwd, base_dir=active_ws)
+            if guard.is_blocked_read(workdir):
+                return False
+            if guard._detect_external_write_targets(code, workdir, active_workspace=active_ws):
+                return False
+            return True
+
+        return False
+
     def authorize_tool(
         self,
         tool_name: str,
         args: dict[str, Any],
         bridge_mgr,
+        *,
+        guard=None,
+        workspace_mgr=None,
     ) -> dict[str, Any]:
         """Validate whether the calling conversation is authorized to execute `tool_name`."""
         if not self.enabled:
@@ -585,6 +662,22 @@ class ConversationPermissionManager:
                 f"PermissionDeniedByUser: {win_label} 当前权限策略为「禁止 (deny)」，已拦截 {tool_name}。"
                 "请由用户在浏览器右下角油猴本地桥面板调整该会话链接的权限（不由会话内 Agent 修改）。"
             )
+
+        active_ws = (
+            workspace_mgr.resolve_active_dir({"conversation_id": cid, "tab_id": tab_id})
+            if workspace_mgr is not None
+            else (guard.default_dir if guard is not None else None)
+        )
+        if self._is_global_whitelist_allowed(tool_name, args, guard, active_ws):
+            return {
+                "mode": "per_conversation_bridge",
+                "allowed": True,
+                "bypassed_via": "global_whitelist",
+                "conversation_id": cid,
+                "tab_id": tab_id,
+                "profile": profile,
+                "capabilities": sorted(caps),
+            }
 
         # If profile is "ask" OR an existing restricted profile (e.g. "readonly") lacks this capability:
         # request explicit local-bridge user confirmation on that exact tab!

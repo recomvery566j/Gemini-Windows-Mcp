@@ -89,6 +89,6 @@
     "authorize_password": "",
     "access_token_ttl_sec": 28800,
     "refresh_token_ttl_sec": 2592000,
-    "startup_tcp_check": true
+    "startup_tcp_check": false
   }
 }
