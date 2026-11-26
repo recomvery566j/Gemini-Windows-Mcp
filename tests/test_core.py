@@ -165,6 +165,48 @@ class TestMcpCore(unittest.TestCase):
         snaps = list((self.ws / ".mcp_snapshots").glob("crlf.txt.*.bak"))
         self.assertEqual(len(snaps), 3)
 
+        # Atomic batch edits: mismatched 2nd hunk aborts with closest line hints & leaves file/snapshots untouched
+        multi = self.ws / "multi.py"
+        multi.write_text("import os\n\ndef compute_alpha(x):\n    return x + 1\n\ndef compute_beta(y):\n    return y * 2\n", encoding="utf-8")
+        snap_before = len(list((self.ws / ".mcp_snapshots").glob("multi.py.*.bak")))
+        with self.assertRaises(JsonRpcError) as ctx:
+            self.core.handle("tools/call", {
+                "name": "edit_file",
+                "arguments": {
+                    "path": str(multi),
+                    "edits": [
+                        {"old_text": "import os", "new_text": "import sys"},
+                        {"old_text": "def compute_beta(z):\n    return z * 9", "new_text": "pass"},
+                    ],
+                },
+            })
+        err_msg = str(ctx.exception)
+        self.assertIn("edit #2/2", err_msg)
+        self.assertIn("L6:", err_msg)
+        self.assertIn("import os", multi.read_text(encoding="utf-8"))
+        self.assertEqual(len(list((self.ws / ".mcp_snapshots").glob("multi.py.*.bak"))), snap_before)
+
+        # Valid batch edits apply atomically with single snapshot and single post-edit check
+        r_batch = self.core.handle("tools/call", {
+            "name": "edit_file",
+            "arguments": {
+                "path": str(multi),
+                "edits": [
+                    {"old_text": "import os", "new_text": "import sys"},
+                    {"old_text": "def compute_alpha(x):\n    return x + 1", "new_text": "def compute_alpha(x):\n    return x + 10"},
+                    {"old_text": "def compute_beta(y):\n    return y * 2", "new_text": "def compute_beta(y):\n    return y * 20"},
+                ],
+            },
+        })
+        self.assertFalse(r_batch["isError"])
+        batch_txt = r_batch["content"][0]["text"]
+        self.assertIn("applied 3 edit(s)", batch_txt)
+        self.assertIn("python_syntax: ok", batch_txt)
+        new_src = multi.read_text(encoding="utf-8")
+        self.assertIn("import sys", new_src)
+        self.assertIn("return x + 10", new_src)
+        self.assertIn("return y * 20", new_src)
+
     def test_output_guard_bypass(self):
         og = OutputGuard(self.ws / ".tmp_outputs", max_inline_chars=1200, head_chars=300, tail_chars=300)
         big = "\n".join(f"row-{i:04d}" for i in range(500))
@@ -173,6 +215,16 @@ class TestMcpCore(unittest.TestCase):
         self.assertTrue(log_path.is_file())
         self.assertIn(".tmp_outputs", out)
         self.assertLess(len(out), len(big))
+
+        # read_file truncates directly in memory with original-path line hints (no duplicate .tmp_outputs/read_*.log)
+        big_src = self.ws / "big_source.txt"
+        big_src.write_text("\n".join(f"src-line-{i:04d}-payload" for i in range(1, 200)), encoding="utf-8")
+        small_core = McpCore(deep_merge(self.cfg, {"exec": {"max_inline_chars": 1000}}), approval_cb=lambda *a: (False, False))
+        r_rf = small_core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(big_src)}})
+        rf_txt = r_rf["content"][0]["text"]
+        self.assertIn("无需额外落盘", rf_txt)
+        self.assertIn("start_line=", rf_txt)
+        self.assertFalse(list((self.ws / ".tmp_outputs").glob("read_*.log")))
 
     def test_list_dir_ignores_noise(self):
         (self.ws / "keep.py").write_text("print(1)", encoding="utf-8")
@@ -185,6 +237,20 @@ class TestMcpCore(unittest.TestCase):
         txt = res["content"][0]["text"]
         self.assertIn("keep.py", txt)
         self.assertNotIn("node_modules", txt)
+
+        # Oversized list_dir output must route through OutputGuard to avoid context blow-up
+        many_dir = self.ws / "many_files"
+        many_dir.mkdir()
+        for i in range(60):
+            (many_dir / f"long_entry_filename_{i:03d}_payload_item.txt").write_text("x", encoding="utf-8")
+        small_guard_core = McpCore(deep_merge(self.cfg, {"exec": {"max_inline_chars": 1000}}), approval_cb=lambda *a: (False, False))
+        r_big = small_guard_core.handle("tools/call", {
+            "name": "list_dir",
+            "arguments": {"path": str(many_dir), "max_entries": 200},
+        })
+        big_txt = r_big["content"][0]["text"]
+        self.assertIn(".tmp_outputs", big_txt)
+        self.assertTrue(any((self.ws / ".tmp_outputs").glob("list_*.log")))
 
     def test_async_job_and_workspace_status(self):
         res = self.core.handle("tools/call", {
@@ -232,7 +298,8 @@ class TestMcpCore(unittest.TestCase):
 
         tools = self.core.handle("tools/list", {})["tools"]
         names = {t["name"]: t["description"] for t in tools}
-        self.assertEqual(len(names), 20)
+        self.assertEqual(len(names), 21)
+        self.assertIn("bridge_suggest_ignore_dirs", names)
         for extra_tool in ("find_files", "grep_search", "task_plan"):
             self.assertIn(extra_tool, names)
         for bridge_tool in ("bridge_status", "bridge_upload_media", "bridge_save_generated_media", "bridge_get_task"):
@@ -978,14 +1045,29 @@ class TestMcpCore(unittest.TestCase):
             srv.server_close()
 
     def test_dynamic_workspace_rules_injection_cadence_and_isolation(self):
-        from workspace_rules import DEFAULT_REINJECT_EVERY_CALLS, DEFAULT_REINJECT_EVERY_OUTPUT_CHARS
+        from workspace_rules import DEFAULT_REINJECT_EVERY_CALLS, DEFAULT_REINJECT_EVERY_OUTPUT_CHARS, WorkspaceRulesManager
 
-        # Verify production defaults match the quantitative cadence (20 calls / 48,000 output chars)
+        # Verify production defaults match the quantitative cadence (20 calls / 96,000 output chars)
         default_core = McpCore(self.cfg, approval_cb=lambda *a: (False, False))
         self.assertEqual(default_core.rules.reinject_every_calls, 20)
-        self.assertEqual(default_core.rules.reinject_every_output_chars, 48000)
+        self.assertEqual(default_core.rules.reinject_every_output_chars, 96000)
         self.assertEqual(DEFAULT_REINJECT_EVERY_CALLS, 20)
-        self.assertEqual(DEFAULT_REINJECT_EVERY_OUTPUT_CHARS, 48000)
+        self.assertEqual(DEFAULT_REINJECT_EVERY_OUTPUT_CHARS, 96000)
+
+        # Verify max_total_chars budget accounts for truncated_note length without overrunning across files
+        trunc_dir = self.root / "trunc_rules_ws"
+        trunc_dir.mkdir(parents=True, exist_ok=True)
+        (trunc_dir / "AGENTS.md").write_text("A" * 2400, encoding="utf-8")
+        (trunc_dir / "GEMINI.md").write_text("B" * 800, encoding="utf-8")
+        trunc_mgr = WorkspaceRulesManager({"workspace_rules": {"max_total_chars": 2000}}, trunc_dir)
+        disc_trunc = trunc_mgr.discover_rules(trunc_dir)
+        fmt_trunc = trunc_mgr._format_injection_block(disc_trunc, reason="initial", call_step=1)
+        self.assertIn('...[truncated by max_total_chars]...', fmt_trunc)
+        self.assertIn('<rule_file path="GEMINI.md" omitted="max_total_chars_exceeded" />', fmt_trunc)
+        import re as _re
+        inner_bodies = _re.findall(r'<rule_file path="[^"]+" sha256="[^"]+">\n(.*?)\n</rule_file>', fmt_trunc, flags=_re.S)
+        self.assertEqual(len(inner_bodies), 1)
+        self.assertLessEqual(len(inner_bodies[0]), 2000)
 
         tok = "pcmcp_rules_admin_tok"
         cfg_rules = deep_merge(self.cfg, {
@@ -1029,7 +1111,7 @@ class TestMcpCore(unittest.TestCase):
             r_init = core.handle("tools/call", {"name": "write_file", "arguments": {"path": str(small_file), "content": "hi"}})
             self.assertEqual(len(r_init["content"]), 1)
 
-            # 2) Create AGENTS.md and .gemini/rules/01-style.md mid-session -> immediate rules_changed injection
+            # 2) Create AGENTS.md and .gemini/rules/01-style.md mid-session -> immediate rules_changed merged into last text block
             agents_md = self.ws / "AGENTS.md"
             agents_md.write_text("Rule Alpha: verify everything.", encoding="utf-8")
             rules_sub = self.ws / ".gemini" / "rules"
@@ -1038,12 +1120,14 @@ class TestMcpCore(unittest.TestCase):
             style_md.write_text("Style: keep concise.", encoding="utf-8")
 
             r_changed = core.handle("tools/call", {"name": "workspace_status", "arguments": {}})
-            self.assertEqual(len(r_changed["content"]), 3)
-            # content[0] remains clean JSON and content[1] remains canary PNG while content[2] holds <workspace_rules>
-            ws_changed_obj = json.loads(r_changed["content"][0]["text"])
-            self.assertEqual(len(ws_changed_obj["workspace_rules"]["detected_files"]), 2)
+            # Single text block + canary PNG (no extra trailing text block that Gemini Web MCP gateway would overwrite with)
+            self.assertEqual(len(r_changed["content"]), 2)
             self.assertEqual(r_changed["content"][1]["type"], "image")
-            inj1 = r_changed["content"][2]["text"]
+            ws_raw, sep, inj_part = r_changed["content"][0]["text"].partition("\n\n<workspace_rules")
+            self.assertEqual(sep, "\n\n<workspace_rules")
+            ws_changed_obj = json.loads(ws_raw)
+            self.assertEqual(len(ws_changed_obj["workspace_rules"]["detected_files"]), 2)
+            inj1 = "<workspace_rules" + inj_part
             self.assertIn('reason="rules_changed"', inj1)
             self.assertIn("Rule Alpha: verify everything.", inj1)
             self.assertIn("Style: keep concise.", inj1)
@@ -1051,36 +1135,43 @@ class TestMcpCore(unittest.TestCase):
             # 3) Next 2 small calls (< 3 calls, < 600 output chars) do NOT re-inject
             r_c1 = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(small_file)}})
             self.assertEqual(len(r_c1["content"]), 1)
+            self.assertNotIn("<workspace_rules", r_c1["content"][0]["text"])
             r_c2 = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(small_file)}})
             self.assertEqual(len(r_c2["content"]), 1)
+            self.assertNotIn("<workspace_rules", r_c2["content"][0]["text"])
 
-            # 4) 3rd call since last injection hits reinject_every_calls=3 -> periodic_calls
+            # 4) 3rd call since last injection hits reinject_every_calls=3 -> periodic_calls merged into single text block
             r_c3 = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(small_file)}})
-            self.assertEqual(len(r_c3["content"]), 2)
-            self.assertIn('reason="periodic_calls"', r_c3["content"][1]["text"])
+            self.assertEqual(len(r_c3["content"]), 1)
+            self.assertIn("hi", r_c3["content"][0]["text"])
+            self.assertIn('reason="periodic_calls"', r_c3["content"][0]["text"])
 
             # 5) Big tool output (>= 600 chars) triggers output_volume early on the very first call after periodic
             big_file = self.ws / "big.txt"
             big_file.write_text("X" * 700, encoding="utf-8")
             r_big = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(big_file)}})
-            self.assertEqual(len(r_big["content"]), 2)
-            self.assertIn('reason="output_volume"', r_big["content"][1]["text"])
+            self.assertEqual(len(r_big["content"]), 1)
+            self.assertIn("X" * 700, r_big["content"][0]["text"])
+            self.assertIn('reason="output_volume"', r_big["content"][0]["text"])
 
             # 6) Edit AGENTS.md -> next call immediately detects SHA change (rules_changed)
             agents_md.write_text("Rule Beta: updated instructions.", encoding="utf-8")
             r_edit = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(small_file)}})
-            self.assertEqual(len(r_edit["content"]), 2)
-            self.assertIn('reason="rules_changed"', r_edit["content"][1]["text"])
-            self.assertIn("Rule Beta: updated instructions.", r_edit["content"][1]["text"])
+            self.assertEqual(len(r_edit["content"]), 1)
+            self.assertIn("hi", r_edit["content"][0]["text"])
+            self.assertIn('reason="rules_changed"', r_edit["content"][0]["text"])
+            self.assertIn("Rule Beta: updated instructions.", r_edit["content"][0]["text"])
 
             # 7) Remove all rule files -> emits rules_removed once, then stops injecting
             agents_md.unlink()
             style_md.unlink()
             r_rem = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(small_file)}})
-            self.assertEqual(len(r_rem["content"]), 2)
-            self.assertIn('reason="rules_removed"', r_rem["content"][1]["text"])
+            self.assertEqual(len(r_rem["content"]), 1)
+            self.assertIn("hi", r_rem["content"][0]["text"])
+            self.assertIn('reason="rules_removed"', r_rem["content"][0]["text"])
             r_after_rem = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(small_file)}})
             self.assertEqual(len(r_after_rem["content"]), 1)
+            self.assertNotIn("<workspace_rules", r_after_rem["content"][0]["text"])
 
             # 8) Re-create default AGENTS.md + test HTTP Mcp-Session-Id isolation & /bridge/rules admin guard
             agents_md.write_text("Default Workspace Rule.", encoding="utf-8")
@@ -1100,26 +1191,29 @@ class TestMcpCore(unittest.TestCase):
             self.assertTrue(r_tamper["isError"])
             self.assertIn("control-plane", r_tamper["content"][0]["text"])
 
-            # Two distinct Mcp-Session-Id sessions each get their own Turn-1 initial injection
+            # Two distinct Mcp-Session-Id sessions each get their own Turn-1 initial injection (merged single text block)
             _, rpc_a1 = req("/mcp", method="POST", bearer=tok, extra_headers={"Mcp-Session-Id": "ses_alpha"}, body={
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {"name": "read_file", "arguments": {"path": str(small_file)}},
             })
-            self.assertEqual(len(rpc_a1["result"]["content"]), 2)
-            self.assertIn('reason="initial"', rpc_a1["result"]["content"][1]["text"])
+            self.assertEqual(len(rpc_a1["result"]["content"]), 1)
+            self.assertIn("hi", rpc_a1["result"]["content"][0]["text"])
+            self.assertIn('reason="initial"', rpc_a1["result"]["content"][0]["text"])
 
             _, rpc_a2 = req("/mcp", method="POST", bearer=tok, extra_headers={"Mcp-Session-Id": "ses_alpha"}, body={
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
                 "params": {"name": "read_file", "arguments": {"path": str(small_file)}},
             })
             self.assertEqual(len(rpc_a2["result"]["content"]), 1)
+            self.assertNotIn("<workspace_rules", rpc_a2["result"]["content"][0]["text"])
 
             _, rpc_b1 = req("/mcp", method="POST", bearer=tok, extra_headers={"Mcp-Session-Id": "ses_beta"}, body={
                 "jsonrpc": "2.0", "id": 3, "method": "tools/call",
                 "params": {"name": "read_file", "arguments": {"path": str(small_file)}},
             })
-            self.assertEqual(len(rpc_b1["result"]["content"]), 2)
-            self.assertIn('reason="initial"', rpc_b1["result"]["content"][1]["text"])
+            self.assertEqual(len(rpc_b1["result"]["content"]), 1)
+            self.assertIn("hi", rpc_b1["result"]["content"][0]["text"])
+            self.assertIn('reason="initial"', rpc_b1["result"]["content"][0]["text"])
 
             # 9) Bridge Turn-1 promotion + per-conversation custom rules_dir isolation
             proj_b = self.root / "project_b"
@@ -1133,8 +1227,9 @@ class TestMcpCore(unittest.TestCase):
                 "is_generating": True,
             })
             res_t1 = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(small_file)}})
-            self.assertEqual(len(res_t1["content"]), 2)
-            self.assertIn("Default Workspace Rule.", res_t1["content"][1]["text"])
+            self.assertEqual(len(res_t1["content"]), 1)
+            self.assertIn("hi", res_t1["content"][0]["text"])
+            self.assertIn("Default Workspace Rule.", res_t1["content"][0]["text"])
 
             # Promote tab_r1 -> cid_r1_promoted; next call must NOT double-inject
             req("/bridge/heartbeat", method="POST", body={
@@ -1145,6 +1240,7 @@ class TestMcpCore(unittest.TestCase):
             })
             res_t2 = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(small_file)}})
             self.assertEqual(len(res_t2["content"]), 1)
+            self.assertNotIn("<workspace_rules", res_t2["content"][0]["text"])
 
             # Bind custom rules_dir for cid_r1_promoted -> next call injects Project B Exclusive Rule
             st_set_dir, set_resp = req("/bridge/rules", method="POST", body={
@@ -1156,8 +1252,9 @@ class TestMcpCore(unittest.TestCase):
             self.assertEqual(st_set_dir, 200)
             self.assertTrue(set_resp["result"]["is_custom"])
             res_proj_b = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(small_file)}})
-            self.assertEqual(len(res_proj_b["content"]), 2)
-            self.assertIn("Project B Exclusive Rule.", res_proj_b["content"][1]["text"])
+            self.assertEqual(len(res_proj_b["content"]), 1)
+            self.assertIn("hi", res_proj_b["content"][0]["text"])
+            self.assertIn("Project B Exclusive Rule.", res_proj_b["content"][0]["text"])
 
             # Force reset via /bridge/rules -> next call re-injects
             st_rst, _ = req("/bridge/rules", method="POST", body={
@@ -1166,8 +1263,9 @@ class TestMcpCore(unittest.TestCase):
             })
             self.assertEqual(st_rst, 200)
             res_rst = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(small_file)}})
-            self.assertEqual(len(res_rst["content"]), 2)
-            self.assertIn("Project B Exclusive Rule.", res_rst["content"][1]["text"])
+            self.assertEqual(len(res_rst["content"]), 1)
+            self.assertIn("hi", res_rst["content"][0]["text"])
+            self.assertIn("Project B Exclusive Rule.", res_rst["content"][0]["text"])
 
             # Returning tab_r1 to blank /app starts a clean new conversation with Default Workspace Rule
             req("/bridge/heartbeat", method="POST", body={
@@ -1177,9 +1275,10 @@ class TestMcpCore(unittest.TestCase):
                 "is_generating": True,
             })
             res_fresh = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(small_file)}})
-            self.assertEqual(len(res_fresh["content"]), 2)
-            self.assertIn('reason="initial"', res_fresh["content"][1]["text"])
-            self.assertIn("Default Workspace Rule.", res_fresh["content"][1]["text"])
+            self.assertEqual(len(res_fresh["content"]), 1)
+            self.assertIn("hi", res_fresh["content"][0]["text"])
+            self.assertIn('reason="initial"', res_fresh["content"][0]["text"])
+            self.assertIn("Default Workspace Rule.", res_fresh["content"][0]["text"])
         finally:
             srv.shutdown()
             srv.server_close()
@@ -1292,12 +1391,14 @@ class TestMcpCore(unittest.TestCase):
                 "is_generating": True,
             })
 
-            # workspace_status reports ws_a as default_workspace + injects Rule Alpha
+            # workspace_status reports ws_a as default_workspace + merges Rule Alpha into text block
             r_ws_a = core.handle("tools/call", {"name": "workspace_status", "arguments": {}})
-            ws_a_status = json.loads(r_ws_a["content"][0]["text"])
+            ws_a_raw, sep_a, inj_a = r_ws_a["content"][0]["text"].partition("\n\n<workspace_rules")
+            self.assertEqual(sep_a, "\n\n<workspace_rules")
+            ws_a_status = json.loads(ws_a_raw)
             self.assertEqual(Path(ws_a_status["default_workspace"]), ws_a.resolve())
             self.assertTrue(ws_a_status["workspace_binding"]["is_switched"])
-            self.assertIn("Rule Alpha: stay inside ProjectAlpha.", r_ws_a["content"][-1]["text"])
+            self.assertIn("Rule Alpha: stay inside ProjectAlpha.", inj_a)
 
             # Relative list_dir(".") and read_file("alpha.txt") resolve inside ws_a!
             r_list_a = core.handle("tools/call", {"name": "list_dir", "arguments": {"path": "."}})
@@ -1410,7 +1511,7 @@ class TestMcpCore(unittest.TestCase):
             "is_generating": True,
         })
 
-        # Verify readonly works for find_files & grep_search without hitting exec denial
+        # Verify readonly works for find_files, grep_search & push_file without hitting exec/write denial
         r_find = core.handle("tools/call", {"name": "find_files", "arguments": {"pattern": "*.py"}})
         self.assertFalse(r_find["isError"])
         find_txt = r_find["content"][0]["text"]
@@ -1426,6 +1527,15 @@ class TestMcpCore(unittest.TestCase):
         self.assertIn("src/alpha.py:2: ", grep_txt)
         self.assertNotIn("bin.dat", grep_txt)
 
+        r_push_ro = core.handle("tools/call", {
+            "name": "push_file",
+            "arguments": {"path": "src/alpha.py", "inline_preview": False},
+        })
+        self.assertFalse(r_push_ro["isError"])
+        push_ro_obj = json.loads(r_push_ro["content"][0]["text"])
+        self.assertTrue(push_ro_obj["pushed"])
+        self.assertIn("/files/", push_ro_obj["download_url"])
+
         # exec tool is still denied under readonly
         r_exec = core.handle("tools/call", {"name": "python", "arguments": {"code": "print(1)"}})
         self.assertTrue(r_exec["isError"])
@@ -1439,6 +1549,31 @@ class TestMcpCore(unittest.TestCase):
         })
         self.assertIn("alt_mod.py:1:", r_grep_alt["content"][0]["text"])
         self.assertNotIn("alpha.py", r_grep_alt["content"][0]["text"])
+
+        # Custom workspace.ignored_dirs + built-in browser profile dirs are filtered cleanly across list_dir/find_files/grep_search
+        (alt_ws / ".brave-agent-profile").mkdir(exist_ok=True)
+        (alt_ws / ".brave-agent-profile" / "noise.py").write_text("NOISE_HIT\n", encoding="utf-8")
+        (alt_ws / "legacy_v5_src").mkdir(exist_ok=True)
+        (alt_ws / "legacy_v5_src" / "old.py").write_text("OLD_VERSION_HIT\n", encoding="utf-8")
+        cfg_ign = deep_merge(cfg, {"workspace": {"ignored_dirs": ["legacy_v*"]}})
+        core_ign = McpCore(cfg_ign, config_path=self.root / "cfg_ign.json")
+        core_ign.bridge.heartbeat({
+            "tab_id": "tab_ign",
+            "conversation_id": "cid_ign",
+            "url": "https://gemini.google.com/app/cid_ign",
+            "is_generating": True,
+        })
+        core_ign.workspaces.bind_workspace(conversation_id="cid_ign", workspace_dir=str(alt_ws))
+        list_ign = core_ign.handle("tools/call", {"name": "list_dir", "arguments": {"path": ".", "recursive": True}})["content"][0]["text"]
+        self.assertNotIn(".brave-agent-profile", list_ign)
+        self.assertNotIn("legacy_v5_src", list_ign)
+        find_ign = core_ign.handle("tools/call", {"name": "find_files", "arguments": {"pattern": "*.py"}})["content"][0]["text"]
+        self.assertNotIn("noise.py", find_ign)
+        self.assertNotIn("old.py", find_ign)
+        grep_ign = core_ign.handle("tools/call", {"name": "grep_search", "arguments": {"query": "HIT"}})["content"][0]["text"]
+        self.assertIn("(no matches)", grep_ign)
+        grep_incl = core_ign.handle("tools/call", {"name": "grep_search", "arguments": {"query": "OLD_VERSION_HIT", "include_ignored": True}})["content"][0]["text"]
+        self.assertIn("legacy_v5_src/old.py", grep_incl)
 
     def test_post_edit_checks_syntax_and_exec_gate(self):
         tok = "pcmcp_checks_tok_123"
@@ -1497,6 +1632,33 @@ class TestMcpCore(unittest.TestCase):
         self.assertIn("json_syntax", r_bad_json["content"][0]["text"])
         self.assertIn('"ok": false', r_bad_json["content"][0]["text"])
 
+        # TOML syntax check (Python 3.11+ tomllib)
+        r_ok_toml = core.handle("tools/call", {
+            "name": "write_file",
+            "arguments": {"path": "good.toml", "content": '[pkg]\nname = "pc-work-mcp"\n'},
+        })
+        self.assertIn('"toml_syntax: ok"', r_ok_toml["content"][0]["text"])
+        r_bad_toml = core.handle("tools/call", {
+            "name": "write_file",
+            "arguments": {"path": "bad.toml", "content": '[pkg\nname = 123\n'},
+        })
+        self.assertIn("toml_syntax", r_bad_toml["content"][0]["text"])
+        self.assertIn('"ok": false', r_bad_toml["content"][0]["text"])
+
+        # PowerShell syntax check via Language.Parser (when pwsh_exe is available on Windows)
+        if core.runner.pwsh_exe:
+            r_ok_ps1 = core.handle("tools/call", {
+                "name": "write_file",
+                "arguments": {"path": "ok_script.ps1", "content": "# 中文注释\nWrite-Output 'ok'\n"},
+            })
+            self.assertIn('"powershell_syntax: ok"', r_ok_ps1["content"][0]["text"])
+            r_bad_ps1 = core.handle("tools/call", {
+                "name": "write_file",
+                "arguments": {"path": "bad_script.ps1", "content": "if ($true {\n  Write-Output 'oops'\n"},
+            })
+            self.assertIn("powershell_syntax", r_bad_ps1["content"][0]["text"])
+            self.assertIn('"ok": false', r_bad_ps1["content"][0]["text"])
+
         # 2) Grant 'full' (includes exec) -> .gemini/checks.json command executes and feeds back failure lines!
         core.permissions.set_policy(conversation_id="cid_chk", profile="full", scope="persistent")
         r_full_edit = core.handle("tools/call", {
@@ -1544,19 +1706,28 @@ class TestMcpCore(unittest.TestCase):
             self.assertTrue(r_prot["isError"])
             self.assertIn("PermissionDenied", r_prot["content"][0]["text"])
 
-            # Turn-1 (/app): set plan + schedule_continue -> awaits cid
+            # Turn-1 (/app): set plan (mark step 1 in_progress) + schedule_continue -> awaits cid; quota NOT deducted yet
             r_set = core.handle("tools/call", {
                 "name": "task_plan",
                 "arguments": {
                     "action": "set",
                     "goal": "Refactor core module and verify",
-                    "steps": ["Inspect module", "Patch bug", "Run tests"],
+                    "steps": [
+                        {"title": "Inspect module", "status": "in_progress"},
+                        "Patch bug",
+                        "Run tests",
+                    ],
                 },
             })
             set_obj = json.loads(r_set["content"][0]["text"])
             self.assertEqual(set_obj["plan"]["progress"], "0/3")
 
             long_handoff = "A" * 140  # Exceeds max_handoff_chars=80 -> clipped tightly
+            r_sched_dup = core.handle("tools/call", {
+                "name": "task_plan",
+                "arguments": {"action": "schedule_continue", "handoff": "Superseded draft"},
+            })
+            dup_obj = json.loads(r_sched_dup["content"][0]["text"])
             r_sched = core.handle("tools/call", {
                 "name": "task_plan",
                 "arguments": {"action": "schedule_continue", "handoff": long_handoff, "delay_sec": 1},
@@ -1565,9 +1736,12 @@ class TestMcpCore(unittest.TestCase):
             self.assertEqual(sched_obj["task"]["kind"], "continue_turn")
             self.assertEqual(sched_obj["task"]["status"], "awaiting_cid")
             self.assertEqual(sched_obj["task"]["delay_sec"], 5)  # Clamped to min_cooldown_sec=5
+            self.assertEqual(sched_obj["scheduled_turn_index"], 1)  # Superseding draft did NOT burn turn 1
+            self.assertEqual(sched_obj["plan"]["auto_turns_used"], 0)
             self.assertLessEqual(len(sched_obj["plan"]["last_handoff"]), 80)
+            self.assertEqual(core.bridge.get_task(dup_obj["task"]["task_id"])["status"], "cancelled")
 
-            # Turn-1 settles to cid_plan_99 -> promotes plan + unqueues continue_turn
+            # Turn-1 settles to cid_plan_99 -> promotes plan + unqueues continue_turn; quota still 0 until actually sent
             _, hb = req("/bridge/heartbeat", method="POST", body={
                 "tab_id": "tab_p1",
                 "conversation_id": "cid_plan_99",
@@ -1575,18 +1749,23 @@ class TestMcpCore(unittest.TestCase):
                 "is_generating": False,
             })
             self.assertIn(sched_obj["task"]["task_id"], hb["resolved_tasks"])
-            self.assertEqual(hb["task_plan"]["auto_turns_used"], 1)
+            self.assertEqual(hb["task_plan"]["auto_turns_used"], 0)
 
             _, poll = req("/bridge/tasks?tab_id=tab_p1&conversation_id=cid_plan_99")
             self.assertEqual(len(poll["actions"]), 1)
             self.assertEqual(poll["actions"][0]["action"], "continue_turn")
+            wake_prompt = poll["actions"][0]["task"]["prompt"]
+            self.assertIn("进行中[#1:Inspect module]", wake_prompt)
+            self.assertIn("下步待办[#2:Patch bug]", wake_prompt)
+            self.assertIn("无需再调 task_plan(get)", wake_prompt)
             req("/bridge/task_result", method="POST", body={
                 "task_id": sched_obj["task"]["task_id"],
                 "status": "completed",
                 "conversation_id": "cid_plan_99",
             })
+            self.assertEqual(core.task_plans.get_plan(cid="cid_plan_99", tab_id="tab_p1")["plan"]["auto_turns_used"], 1)
 
-            # Turn 2 wakeup + hit max_auto_turns=2 -> 3rd schedule rejected
+            # Failed send does NOT burn quota
             core.bridge.heartbeat({
                 "tab_id": "tab_p1",
                 "conversation_id": "cid_plan_99",
@@ -1597,12 +1776,32 @@ class TestMcpCore(unittest.TestCase):
                 "name": "task_plan",
                 "arguments": {"action": "update", "step_updates": [{"id": 1, "status": "done"}]},
             })
+            r_fail = core.handle("tools/call", {
+                "name": "task_plan",
+                "arguments": {"action": "schedule_continue", "handoff": "Retry step 2"},
+            })
+            fail_obj = json.loads(r_fail["content"][0]["text"])
+            req("/bridge/task_result", method="POST", body={
+                "task_id": fail_obj["task"]["task_id"],
+                "status": "failed",
+                "error": "input_box_not_found",
+                "conversation_id": "cid_plan_99",
+            })
+            self.assertEqual(core.task_plans.get_plan(cid="cid_plan_99", tab_id="tab_p1")["plan"]["auto_turns_used"], 1)
+
+            # Turn 2 wakeup completes -> auto_turns_used reaches max_auto_turns=2 -> 3rd schedule rejected
             r_sched2 = core.handle("tools/call", {
                 "name": "task_plan",
                 "arguments": {"action": "schedule_continue", "handoff": "Run step 2"},
             })
             sched2 = json.loads(r_sched2["content"][0]["text"])
-            self.assertEqual(sched2["plan"]["auto_turns_used"], 2)
+            self.assertEqual(sched2["scheduled_turn_index"], 2)
+            req("/bridge/task_result", method="POST", body={
+                "task_id": sched2["task"]["task_id"],
+                "status": "completed",
+                "conversation_id": "cid_plan_99",
+            })
+            self.assertEqual(core.task_plans.get_plan(cid="cid_plan_99", tab_id="tab_p1")["plan"]["auto_turns_used"], 2)
 
             with self.assertRaises(JsonRpcError):
                 core.handle("tools/call", {
@@ -1610,15 +1809,25 @@ class TestMcpCore(unittest.TestCase):
                     "arguments": {"action": "schedule_continue", "handoff": "Exceed cap"},
                 })
 
-            # User clicks stop on Tampermonkey chip -> cancels pending continue_turn & sets stopped
+            # Reset plan, queue a new continue_turn, and verify stop button cancels pending continue_turn
+            core.handle("tools/call", {
+                "name": "task_plan",
+                "arguments": {"action": "set", "goal": "Cancel check", "steps": ["Only step"]},
+            })
+            r_sched3 = core.handle("tools/call", {
+                "name": "task_plan",
+                "arguments": {"action": "schedule_continue", "handoff": "Pending before stop"},
+            })
+            sched3 = json.loads(r_sched3["content"][0]["text"])
             st_stop, stop_res = req("/bridge/task_plan", method="POST", body={
                 "action": "stop",
                 "conversation_id": "cid_plan_99",
                 "tab_id": "tab_p1",
             })
             self.assertEqual(st_stop, 200)
-            self.assertIn(sched2["task"]["task_id"], stop_res["cancelled_task_ids"])
+            self.assertIn(sched3["task"]["task_id"], stop_res["cancelled_task_ids"])
             self.assertEqual(stop_res["plan"]["status"], "stopped")
+            self.assertEqual(stop_res["plan"]["auto_turns_used"], 0)
         finally:
             srv.shutdown()
             srv.server_close()
@@ -1848,10 +2057,17 @@ class TestMcpCore(unittest.TestCase):
             })
             self.assertFalse(r_bsav["isError"])
 
-            # 2) Readonly whitelist entry allows read/search, blocks write_file
+            # 2) Readonly whitelist entry allows read/search/push_file, blocks write_file
             r_ro_read = core.handle("tools/call", {"name": "read_file", "arguments": {"path": str(notes_ro / "ref.txt")}})
             self.assertFalse(r_ro_read["isError"])
             self.assertIn("readonly reference", r_ro_read["content"][0]["text"])
+
+            r_ro_push = core.handle("tools/call", {
+                "name": "push_file",
+                "arguments": {"path": str(notes_ro / "ref.txt"), "inline_preview": False},
+            })
+            self.assertFalse(r_ro_push["isError"])
+            self.assertTrue(json.loads(r_ro_push["content"][0]["text"])["pushed"])
 
             core.permissions.approval_timeout_sec = 1
             r_ro_write = core.handle("tools/call", {
@@ -1963,6 +2179,130 @@ class TestMcpCore(unittest.TestCase):
                 "path": str(self.blocked),
             })
             self.assertEqual(st_blk, 400)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_bridge_ignored_dirs_management_and_async_suggestion(self):
+        tok = "pcmcp_ign_tok_777"
+        cfg_path = self.root / "cfg_ign_bridge.json"
+        cfg = deep_merge(self.cfg, {
+            "auth": {"enabled": True, "token": tok},
+            "permissions": {"per_conversation_enabled": True, "new_conversation_default_profile": "readonly"},
+            "workspace": {"popup_approval": {"enabled": False}, "ignored_dirs": []},
+        })
+        cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        core = McpCore(cfg, config_path=cfg_path)
+        srv = McpServer(("127.0.0.1", 0), Handler, core, cfg)
+        port = srv.server_address[1]
+        base = f"http://127.0.0.1:{port}"
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            def req(path, method="GET", body=None, bearer=tok):
+                data = json.dumps(body).encode("utf-8") if body is not None else None
+                headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
+                if data is not None:
+                    headers["Content-Type"] = "application/json"
+                r = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+                try:
+                    with urllib.request.urlopen(r, timeout=5) as resp:
+                        return resp.status, json.loads(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as exc:
+                    return exc.code, json.loads(exc.read().decode("utf-8"))
+
+            noisy_dir = self.ws / "noisy_logs"
+            noisy_dir.mkdir(exist_ok=True)
+            (noisy_dir / "trace.py").write_text("NOISY_TRACE_TOKEN = 1\n", encoding="utf-8")
+            keep_dir = self.ws / "keep_src"
+            keep_dir.mkdir(exist_ok=True)
+            (keep_dir / "app.py").write_text("CLEAN_APP = 1\n", encoding="utf-8")
+
+            # 1) Local-admin token gate rejects Google OAuth at_* tokens
+            oauth_at, _ = srv.oauth.issue_tokens("google_ign_client")
+            st_forb, _ = req("/bridge/ignored_dirs", bearer=oauth_at)
+            self.assertEqual(st_forb, 403)
+
+            # 2) Direct Tampermonkey /bridge/ignored_dirs CRUD persists to config.json & hot-reloads
+            st_add, add_res = req("/bridge/ignored_dirs", method="POST", body={
+                "action": "add",
+                "dirs": [str(self.ws / "temp_build"), "legacy_*"],
+            })
+            self.assertEqual(st_add, 200)
+            self.assertIn("temp_build", add_res["ignored_dirs"])
+            self.assertIn("legacy_*", add_res["ignored_dirs"])
+            saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+            self.assertIn("temp_build", saved["workspace"]["ignored_dirs"])
+
+            st_rem, rem_res = req("/bridge/ignored_dirs", method="POST", body={
+                "action": "remove",
+                "dir": "temp_build",
+            })
+            self.assertEqual(st_rem, 200)
+            self.assertNotIn("temp_build", rem_res["ignored_dirs"])
+
+            # 3) Turn-1 (/app): agent sees noisy_logs -> pushes async suggestion & stops
+            core.bridge.heartbeat({
+                "tab_id": "tab_ign1",
+                "conversation_id": None,
+                "url": "https://gemini.google.com/app",
+                "is_generating": True,
+            })
+            r_sug = core.handle("tools/call", {
+                "name": "bridge_suggest_ignore_dirs",
+                "arguments": {
+                    "dirs": [str(noisy_dir), "cache_dump"],
+                    "reason": "根目录检索杂音过多",
+                },
+            })
+            self.assertFalse(r_sug["isError"])
+            sug_obj = json.loads(r_sug["content"][0]["text"])
+            self.assertTrue(sug_obj["queued"])
+            self.assertEqual(sug_obj["dirs"], ["noisy_logs", "cache_dump"])
+            self.assertIn("停止当前回合", sug_obj["instruction"])
+
+            # Turn-1 settles to cid_ign_888 -> suggestion promotes & appears in heartbeat
+            _, hb = req("/bridge/heartbeat", method="POST", body={
+                "tab_id": "tab_ign1",
+                "conversation_id": "cid_ign_888",
+                "url": "https://gemini.google.com/app/cid_ign_888",
+                "is_generating": False,
+            })
+            self.assertEqual(len(hb["pending_ignore_suggestions"]), 1)
+            self.assertEqual(hb["pending_ignore_suggestions"][0]["suggestion_id"], sug_obj["suggestion_id"])
+
+            # 4) User approves only ["noisy_logs"] from popup -> persisted permanently & hot-applied to list_dir/find_files/grep
+            st_dec, dec_res = req("/bridge/ignored_dirs/decision", method="POST", body={
+                "suggestion_id": sug_obj["suggestion_id"],
+                "decision": "approve",
+                "dirs": ["noisy_logs"],
+            })
+            self.assertEqual(st_dec, 200)
+            self.assertIn("noisy_logs", dec_res["ignored_dirs"])
+            self.assertNotIn("cache_dump", dec_res["ignored_dirs"])
+            saved_after = json.loads(cfg_path.read_text(encoding="utf-8"))
+            self.assertIn("noisy_logs", saved_after["workspace"]["ignored_dirs"])
+
+            _, hb2 = req("/bridge/heartbeat", method="POST", body={
+                "tab_id": "tab_ign1",
+                "conversation_id": "cid_ign_888",
+                "url": "https://gemini.google.com/app/cid_ign_888",
+                "is_generating": False,
+            })
+            self.assertEqual(hb2["pending_ignore_suggestions"], [])
+
+            r_list = core.handle("tools/call", {"name": "list_dir", "arguments": {"path": "."}})
+            self.assertNotIn("noisy_logs", r_list["content"][0]["text"])
+            self.assertIn("keep_src", r_list["content"][0]["text"])
+
+            # Suggesting already-ignored dir returns queued=False without nagging user
+            r_dup = core.handle("tools/call", {
+                "name": "bridge_suggest_ignore_dirs",
+                "arguments": {"dirs": ["noisy_logs"]},
+            })
+            dup_obj = json.loads(r_dup["content"][0]["text"])
+            self.assertFalse(dup_obj["queued"])
+            self.assertTrue(dup_obj["already_ignored"])
         finally:
             srv.shutdown()
             srv.server_close()

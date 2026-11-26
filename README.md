@@ -3,12 +3,12 @@
 一个纯粹、可自举的 Windows 本机工作台 MCP 服务：
 
 - **零第三方强制依赖**：服务端本体仅使用 Python 标准库，解压即可运行。
-- **原生只读检索与写后轻量校验**：内置纯标准库 `find_files` / `grep_search`（无需消耗 `exec` 权限）；`write_file` / `edit_file` 自动执行瞬时语法检查与可选工程 `lint/test` 命令并结构化回喂，充分利用网页端受限的单轮执行步数。
-- **轻量任务计划与受控自唤醒（`task_plan`）**：持久化当前会话的任务步骤与自动续跑次数上限，配合油猴桥接在停稳冷却+随机抖动后自动唤醒下一回合继续完善目标；提示词强制极简交接（≤120 字）防上下文膨胀，油猴端随时可一键暂停。
+- **原生只读检索与写后轻量校验**：内置纯标准库 `find_files` / `grep_search`（无需消耗 `exec` 权限，支持 `workspace.ignored_dirs` 排除历史目录与浏览器缓存）；`write_file` / `edit_file` 支持多处原子替换、失配行号提示，并自动执行瞬时语法检查（`.py`/`.json`/`.toml`/`.ps1`/可选 `.js`）与可选工程 `lint/test` 命令结构化回喂。
+- **轻量任务计划与受控自唤醒（`task_plan`）**：持久化当前会话的任务步骤与自动续跑次数上限，配合油猴桥接在停稳冷却+随机抖动后自动唤醒下一回合；续跑提示词直接内嵌当前与下一步骤以省去多余拉取，额度仅在油猴实际发送成功后扣减。
 - **首次工作区自举**：首次运行弹出工作区选择框（取消即中止初始化，不会乱建桌面目录；若已置于 `<工作区>\Gemini-Windows-Mcp\` 子目录下则自动回退到外层干净工作区，也可用 `--use-desktop-workspace` 显式建在桌面），并把全套源码、配置、文档与测试一次性放到工作区的 `Gemini-Windows-Mcp\` 子目录下，工作区根目录保持洁净。
 - **连接前强制本地鉴权**：必须先在本地派发 `auth.token` 后才能启动服务或响应 OAuth / Google 连接。
 - **透明的媒体边界与动态探针**：在 MCP `instructions` 与工具提示词中明确当前网关/沙箱边界缺陷，并附带 1×1 像素探测图以感知上游限制是否松动。
-- **按需动态工作区提示词注入（`workspace_rules`）**：无需依赖容易因 Google 前端变更而失效的发包劫持，自动扫描工作区 `AGENTS.md`、`GEMINI.md`、`.gemini/rules/*.md` 并计算 SHA-256——仅在会话**首次调用任意工具**、**规则文档发生修改/增删**、或长上下文下达到重锚阈值（默认每 **20 步**工具调用或累计 **48,000 字符**工具输出，先到先触发）时，将最新 `<workspace_rules>` 块附带在工具返回尾部以对抗网页随机压缩与长程注意力衰减。
+- **按需动态工作区提示词注入（`workspace_rules`）**：无需依赖容易因 Google 前端变更而失效的发包劫持，自动扫描工作区 `AGENTS.md`、`GEMINI.md`、`.gemini/rules/*.md` 并计算 SHA-256——仅在会话**首次调用任意工具**、**规则文档发生修改/增删**、或长上下文下达到重锚阈值（默认每 **20 步**工具调用或累计 **96,000 字符**工具输出，先到先触发）时，将最新 `<workspace_rules>` 块附带在工具返回尾部以对抗网页随机压缩与长程注意力衰减。
 - **无历史外部协议耦合**：已彻底移除 CDP 注入、Cookie 抓包及本地反代生图/读图通道。
 
 ---
@@ -98,7 +98,7 @@ python "<你的工作区路径>\Gemini-Windows-Mcp\server.py"
    - 虽然工作区内包含全部源码与提示词方便定制，但**严禁直接修改正在运行且被当前会话调用的工具文件/接口**，以免工具链失效；如需调整提示词或扩展代码，必须先在工作区内新建独立目录（新版本文件夹）修改，再由用户切换重启。
 4. **动态工作区提示词注入（`workspace_rules`）**：
    - 自动发现当前工作区（或按会话链接单独绑定的目录）中的 `AGENTS.md`、`GEMINI.md`、`.gemini/AGENTS.md`、`.gemini/GEMINI.md` 与 `.gemini/rules/*.md`。
-   - 触发策略：在每个会话**首次调用任意工具**时注入；当规则文件**哈希发生变化或被删除**时立即在下次工具调用更新；在长对话中为对抗网页端随机上下文压缩与长程注意力衰减，每累计 **20 步工具调用**或 **48,000 字符工具输出**（先到先触发，均可在 `config.json` 中调整）自动重新锚定一次。
+   - 触发策略：在每个会话**首次调用任意工具**时注入；当规则文件**哈希发生变化或被删除**时立即在下次工具调用更新；在长对话中为对抗网页端随机上下文压缩与长程注意力衰减，每累计 **20 步工具调用**或 **96,000 字符工具输出**（先到先触发，均可在 `config.json` 中调整）自动重新锚定一次。
    - 若工作区内尚无任何规则文件，则静默跳过，不产生多余噪声；一旦创建规则文档，下一次工具调用即刻生效。
 
 ---
@@ -138,13 +138,13 @@ python "<你的工作区路径>\Gemini-Windows-Mcp\server.py"
 | 命令执行 | `powershell` / `python` / `bash` | 同步执行（默认 60s / 上限 180s），输出超 16KB 自动旁路落盘到 `.tmp_outputs/` |
 | 异步作业 | `start_job` / `get_job_status` / `kill_job` | 独立进程组长任务管理与整树终止 |
 | 状态与边界 | `workspace_status` | 返回引擎探测、工作区、活跃作业、计划进度、边界声明与 1×1 像素探针 |
-| 只读检索 | `list_dir` / `find_files` / `grep_search` | 纯标准库目录列举、通配符找文件与全文/正则检索（均归属 `read` 权限，无需 `exec`） |
-| 文件读写与校验 | `read_file` / `write_file` / `edit_file` | 三区边界 + 写前 `.bak` 快照 + 写后瞬时语法检查（`.py`/`.json`/可选 `.js`）与可选 `.gemini/checks.json`（需 `exec`）结构化回喂 |
-| 图像与投递 | `read_image` / `push_file` | 本地读图（含可选 WinRT OCR）与 `/files/` 签名临时下载链接 |
-| 任务计划 | `task_plan` | 轻量持久化计划状态机（`logs/task_plans.json`）与受控自唤醒续跑（强制极简 `handoff`） |
-| 油猴桥接 | `bridge_status` / `bridge_upload_media` / `bridge_save_generated_media` / `bridge_get_task` | 会话 ID 联动、自动上传发送、生成产物按目标目录下载落盘 |
+| 只读检索 | `list_dir` / `find_files` / `grep_search` | 纯标准库目录列举、通配符找文件与全文/正则检索（均归属 `read` 权限，支持 `workspace.ignored_dirs`） |
+| 文件读写与校验 | `read_file` / `write_file` / `edit_file` | 三区边界 + 写前 `.bak` 快照 + 原子批量替换 `edits`（失配带近似行号）+ 写后瞬时语法检查（`.py`/`.json`/`.toml`/`.ps1`/可选 `.js`）与 `.gemini/checks.json`（需 `exec`） |
+| 图像与投递 | `read_image` / `push_file` | 本地读图（含可选 WinRT OCR）与 `/files/` 签名临时下载链接（均归属 `read` 权限） |
+| 任务计划 | `task_plan` | 轻量持久化计划状态机（`logs/task_plans.json`）与受控自唤醒续跑（直传当前/下一步进度，发送后扣减额度） |
+| 油猴桥接 | `bridge_status` / `bridge_upload_media` / `bridge_save_generated_media` / `bridge_get_task` / `bridge_suggest_ignore_dirs` | 会话 ID 联动、自动上传发送、生成产物按目标目录下载落盘、向油猴弹窗推送 `ignored_dirs` 屏蔽建议 |
 
-> **写后自动 lint/test 配置提示**：无需配置即可对 `.py` / `.json` / `.js` 自动做毫秒级语法校验；若希望改完代码同时自动跑项目 lint 或单元测试，可在服务端 `config.json` 的 `post_edit_checks.on_edit_commands` 或在项目工作区新建 `.gemini/checks.json`（示例：`{"enabled": true, "on_edit": true, "timeout_sec": 15, "commands": [{"name": "test", "cmd": "python -m unittest", "extensions": [".py"]}]}`；注：工作区内 `.gemini/checks.json` 仅在当前会话具备 `exec` 权限时触发）。
+> **写后自动 lint/test 配置提示**：无需配置即可对 `.py` / `.json` / `.toml` / `.ps1` / `.js` 自动做快速语法校验；若希望改完代码同时自动跑项目 lint 或单元测试，可在服务端 `config.json` 的 `post_edit_checks.on_edit_commands` 或在项目工作区新建 `.gemini/checks.json`（示例：`{"enabled": true, "on_edit": true, "timeout_sec": 15, "commands": [{"name": "test", "cmd": "python -m unittest", "extensions": [".py"]}]}`；注：工作区内 `.gemini/checks.json` 仅在当前会话具备 `exec` 权限时触发）。
 
 ---
 

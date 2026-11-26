@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import difflib
 import fnmatch
 import hashlib
 import hmac
@@ -42,7 +43,13 @@ from checks import PostEditChecker  # noqa: E402
 from jobs import JobManager, kill_tree, popen_platform_kwargs  # noqa: E402
 from output_guard import OutputGuard  # noqa: E402
 from permissions import ConversationPermissionManager  # noqa: E402
-from search_tools import find_files as search_find_files, grep_search as search_grep  # noqa: E402
+from search_tools import (  # noqa: E402
+    DEFAULT_IGNORED_DIRS,
+    find_files as search_find_files,
+    grep_search as search_grep,
+    is_ignored_dir_name,
+    normalize_ignore_entry,
+)
 from security import PermissionDeniedByUser, WorkspaceBoundaryGuard, resolve_path  # noqa: E402
 from snapshot import SnapshotManager  # noqa: E402
 from task_plans import TaskPlanManager  # noqa: E402
@@ -76,17 +83,6 @@ def _default_clean_workspace_dir(src_dir: Path | None = None) -> Path:
 class WorkspaceSelectionCancelled(RuntimeError):
     """首次运行用户取消选择工作区且拒绝隐式回退时抛出。"""
 
-DEFAULT_IGNORED_DIRS = frozenset({
-    ".git",
-    "node_modules",
-    "__pycache__",
-    ".venv",
-    "venv",
-    ".mcp_snapshots",
-    ".tmp_outputs",
-    ".pytest_cache",
-    ".mypy_cache",
-})
 
 # ---------------------------------------------------------------------------
 # 默认配置（config.json 覆盖）
@@ -115,6 +111,7 @@ DEFAULT_CONFIG = {
         "initialized": False,
         "default_dir": "",
         "extra_allowed_dirs": [],
+        "ignored_dirs": [],
         "blocked_read_prefixes": [
             r"C:\Windows\System32",
             str(Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data"),
@@ -1303,23 +1300,36 @@ TOOL_DEFS = [
     },
     {
         "name": "edit_file",
-        "description": "对 Windows 文本文件执行精确字符串查找替换（支持 CRLF/LF 兼容匹配；修改前自动生成 .bak 快照；改后自动做轻量语法/可选 lint-test 结构化回喂）。",
+        "description": "对 Windows 文本文件执行精确字符串查找替换（支持单次 old_text/new_text 或原子多处替换 edits 列表，支持 CRLF/LF 兼容匹配；匹配失败时返回最相近行号提示；修改前自动生成 .bak 快照，全部改完后做一次轻量语法/可选 lint-test 结构化回喂）。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "目标文件路径。"},
-                "old_text": {"type": "string", "description": "待替换的原文本片段（精确匹配）。"},
-                "new_text": {"type": "string", "description": "替换后的新文本片段。"},
+                "old_text": {"type": "string", "description": "单处替换时的待替换原文本片段（与 edits 二选一）。"},
+                "new_text": {"type": "string", "description": "单处替换后的新文本片段（与 edits 二选一）。"},
+                "edits": {
+                    "type": "array",
+                    "description": "可选：同一文件内多处原子替换 [{old_text, new_text, replace_all?}]；全部在内存校验通过后再一次性快照、写盘与校验。",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_text": {"type": "string", "description": "待替换原文本片段。"},
+                            "new_text": {"type": "string", "description": "替换后新文本片段。"},
+                            "replace_all": {"type": "boolean", "description": "本项是否替换全部匹配（默认继承顶层 replace_all）。"},
+                        },
+                        "required": ["old_text", "new_text"],
+                    },
+                },
                 "replace_all": {"type": "boolean", "description": "是否替换所有匹配项（默认 false，仅当唯一匹配时才替换）。"},
                 "auto_check": {"type": "boolean", "description": "改后是否自动做瞬时语法/配置的检查（默认 true）。"},
                 "run_checks": {"type": "boolean", "description": "可选：强制执行或跳过工作区 .gemini/checks.json 与配置中的 lint/test 命令。"},
             },
-            "required": ["path", "old_text", "new_text"],
+            "required": ["path"],
         },
     },
     {
         "name": "list_dir",
-        "description": "列出指定目录下的文件与子文件夹（默认自动过滤 .git/node_modules/__pycache__/.venv 等目录，支持 /g/ 路径）。",
+        "description": "列出指定目录下的文件与子文件夹（默认过滤 .git/node_modules/__pycache__/.venv/浏览器配置目录及 workspace.ignored_dirs，支持 /g/ 路径）。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1327,27 +1337,27 @@ TOOL_DEFS = [
                 "pattern": {"type": "string", "description": "文件名通配符（如 *.py，默认 *）。"},
                 "recursive": {"type": "boolean", "description": "是否递归子目录（默认 false）。"},
                 "max_entries": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "最多返回条目数（默认 200）。"},
-                "include_ignored": {"type": "boolean", "description": "是否包含默认忽略目录（默认 false）。"},
+                "include_ignored": {"type": "boolean", "description": "是否包含默认/配置的忽略目录（默认 false）。"},
             },
             "required": ["path"],
         },
     },
     {
         "name": "find_files",
-        "description": "原生只读按文件名/通配符快速检索工作区文件（无需启动 shell，属于 read 权限，默认忽略 .git/node_modules/__pycache__ 等目录）。",
+        "description": "原生只读按文件名/通配符快速检索工作区文件（无需启动 shell，属于 read 权限，默认过滤 .git/node_modules/__pycache__/浏览器配置目录及 workspace.ignored_dirs）。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "起始目录或文件路径（默认当前工作区 '.'）。"},
                 "pattern": {"type": "string", "description": "通配符（如 '*.py' 或 'tests/*.py'，默认 '*'）。"},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "最多返回数量（默认 200）。"},
-                "include_ignored": {"type": "boolean", "description": "是否包含默认忽略目录（默认 false）。"},
+                "include_ignored": {"type": "boolean", "description": "是否包含默认/配置的忽略目录（默认 false）。"},
             },
         },
     },
     {
         "name": "grep_search",
-        "description": "原生只读全文检索（支持字面子串与正则，无需启动 shell，属于 read 权限；自动跳过二进制与超限大文件）。",
+        "description": "原生只读全文检索（支持字面子串与正则，无需启动 shell，属于 read 权限；自动跳过二进制、超限大文件及忽略目录）。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1358,6 +1368,7 @@ TOOL_DEFS = [
                 "include": {"type": "string", "description": "仅检索匹配该通配符的文件（如 '*.py'）。"},
                 "max_matches": {"type": "integer", "minimum": 1, "maximum": 300, "description": "最多返回匹配行数（默认 60）。"},
                 "context_lines": {"type": "integer", "minimum": 0, "maximum": 3, "description": "匹配行前后附带的上下文行数（默认 0）。"},
+                "include_ignored": {"type": "boolean", "description": "是否包含默认/配置的忽略目录（默认 false）。"},
             },
             "required": ["query"],
         },
@@ -1452,11 +1463,34 @@ TOOL_DEFS = [
         },
     },
     {
+        "name": "bridge_suggest_ignore_dirs",
+        "description": (
+            "向本地油猴桥推送工作区目录屏蔽建议（用于过滤噪音/缓存/历史目录到 workspace.ignored_dirs）。"
+            "注意：config.json 受本地安全边界保护，禁止模型直接改写；调用本工具后请在回复正文中列出建议屏蔽的目录及原因并立即停止当前回合，"
+            "待你停笔后油猴插件会在页面弹窗，由用户勾选并保存后永久生效。若只是当前对话需要聚焦某个子项目，也可建议用户通过油猴「会话工作区」单独切工作区。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dirs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "建议加入 workspace.ignored_dirs 的目录名、目录路径或通配符列表（如 ['logs', 'outbox', 'pc-work-mcp-v*']）。",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "简短说明建议屏蔽这些目录的原因（展示在用户确认弹窗中）。",
+                },
+            },
+            "required": ["dirs"],
+        },
+    },
+    {
         "name": "task_plan",
         "description": (
             "轻量持久化任务清单与受控自唤醒续跑工具（应对网页端单轮步数限制，无需用户守候多轮也能逐步完善目标）。"
             "支持 action: set（建/重置计划）、update（更新步骤状态）、get（查看当前进度）、complete（完成收口）、"
-            "schedule_continue（通过油猴桥在本回合停稳冷却后自动发下一轮消息唤醒自己继续干活）、stop（停止自唤醒）。"
+            "schedule_continue（通过油猴桥在本回合停稳冷却后自动发下一轮消息唤醒自己继续干活；唤醒提示词会自动内嵌当前与下一步进度，额度仅在实际发送成功后扣减）、stop（停止自唤醒）。"
             "【极简上下文规范】调用 schedule_continue 回调自己时，handoff 必须用极简干练语言只写下一步具体动作、路径与验收点"
             "（建议 ≤120 字，上限 220 字，严禁复述历史上下文或客套话），否则长会话会被无效信息占满；调用 schedule_continue 后请立即结束本回合输出。"
         ),
@@ -1539,15 +1573,21 @@ def format_exec_output(res: dict, output_guard: OutputGuard) -> dict:
     return text_result(guarded, is_error=res["exit_code"] != 0)
 
 
-def _list_dir_entries(root: Path, pattern: str, recursive: bool,
-                      max_entries: int, include_ignored: bool) -> list[str]:
+def _list_dir_entries(
+    root: Path,
+    pattern: str,
+    recursive: bool,
+    max_entries: int,
+    include_ignored: bool,
+    extra_ignored: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> list[str]:
     rows: list[str] = []
     count = 0
     if not recursive:
         with os.scandir(root) as it:
             entries = sorted(it, key=lambda e: e.name.lower())
         for entry in entries:
-            if not include_ignored and entry.name in DEFAULT_IGNORED_DIRS:
+            if not include_ignored and is_ignored_dir_name(entry.name, extra_ignored):
                 continue
             if not fnmatch.fnmatch(entry.name, pattern):
                 continue
@@ -1563,7 +1603,7 @@ def _list_dir_entries(root: Path, pattern: str, recursive: bool,
 
     for dirpath, dirnames, filenames in os.walk(root):
         if not include_ignored:
-            dirnames[:] = sorted(d for d in dirnames if d not in DEFAULT_IGNORED_DIRS)
+            dirnames[:] = sorted(d for d in dirnames if not is_ignored_dir_name(d, extra_ignored))
         else:
             dirnames.sort()
         rel_dir = Path(dirpath).relative_to(root)
@@ -1591,6 +1631,36 @@ def _list_dir_entries(root: Path, pattern: str, recursive: bool,
             rows.append(f"FILE  {size:>10}  {rel}")
             count += 1
     return rows
+
+
+def _suggest_closest_lines(text: str, needle: str, limit: int = 3) -> list[str]:
+    """Return top closest line hints (`L<n>: <snippet>`) when edit_file fails to match."""
+    non_empty = [ln.strip() for ln in needle.splitlines() if ln.strip()]
+    if not non_empty:
+        return []
+    anchor = non_empty[0]
+    if len(anchor) < 12 and len(non_empty) > 1:
+        anchor = max(non_empty[:4], key=len)
+    anchor_cmp = anchor[:160]
+    lines = text.splitlines()
+    many_lines = len(lines) > 1500
+    scored: list[tuple[float, int, str]] = []
+    for idx, raw_line in enumerate(lines, start=1):
+        cand = raw_line.strip()
+        if not cand:
+            continue
+        cand_cmp = cand[:160]
+        sm = difflib.SequenceMatcher(None, anchor_cmp, cand_cmp)
+        if many_lines and sm.quick_ratio() < 0.45:
+            continue
+        score = sm.ratio()
+        if anchor_cmp in cand_cmp or (len(cand_cmp) >= 6 and cand_cmp in anchor_cmp):
+            score = max(score, 0.72)
+        if score >= 0.45:
+            snippet = cand[:80] + ("..." if len(cand) > 80 else "")
+            scored.append((score, idx, snippet))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [f"L{idx}: {snippet}" for _, idx, snippet in scored[:limit]]
 
 
 class McpCore:
@@ -1706,6 +1776,48 @@ class McpCore:
                 self._output_guard_cache[key] = og
             return og
 
+    def _effective_ignored_dirs(self) -> list[str]:
+        raw = (self.cfg.get("workspace") or {}).get("ignored_dirs") or []
+        return [str(x).strip() for x in raw if str(x).strip()]
+
+    def get_ignored_dirs_snapshot(self) -> dict:
+        return {
+            "ok": True,
+            "default_ignored": sorted(DEFAULT_IGNORED_DIRS),
+            "ignored_dirs": self._effective_ignored_dirs(),
+            "default_workspace": str(self.guard.default_dir),
+        }
+
+    def persist_ignored_dirs(self, entries: list[str]) -> list[str]:
+        clean: list[str] = []
+        seen: set[str] = set()
+        for raw in entries or ():
+            norm = normalize_ignore_entry(raw)
+            if not norm or norm in DEFAULT_IGNORED_DIRS:
+                continue
+            key = norm.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            clean.append(norm)
+        self.cfg.setdefault("workspace", {})["ignored_dirs"] = list(clean)
+
+        def update_ign(obj: dict):
+            obj.setdefault("workspace", {})["ignored_dirs"] = list(clean)
+
+        self.persist_config_mutation(update_ign)
+        return clean
+
+    def add_ignored_dirs(self, entries: list[str]) -> list[str]:
+        cur = self._effective_ignored_dirs()
+        return self.persist_ignored_dirs(cur + list(entries or ()))
+
+    def remove_ignored_dir(self, target: str) -> list[str]:
+        norm = normalize_ignore_entry(target)
+        key = norm.lower() if norm else str(target or "").strip().lower()
+        cur = [x for x in self._effective_ignored_dirs() if x.lower() != key]
+        return self.persist_ignored_dirs(cur)
+
     def _public_base(self) -> str:
         base = str((self.cfg.get("oauth") or {}).get("public_base_url") or "").rstrip("/")
         if base:
@@ -1734,17 +1846,21 @@ class McpCore:
                     "signed URL delivery (push_file), persistent task plan & bounded self-wake (task_plan), "
                     "and Tampermonkey browser bridge tools (bridge_status/bridge_upload_media/bridge_save_generated_media/bridge_get_task). "
                     "【检索与改写效率】查找文件或全文检索优先用只读工具 find_files / grep_search（无需消耗 exec 权限）；"
-                    "write_file / edit_file 会自动执行轻量语法及配置的 lint/test 校验并结构化回喂，请直接依据反馈修复。"
+                    "write_file / edit_file 会自动执行轻量语法及配置的 lint/test 校验并结构化回喂，请直接依据反馈修复；"
+                    "同一文件需改多处时优先用 edit_file(edits=[...]) 一次原子替换以节省步数。"
                     "【长任务自主续跑约束】多步任务可用 task_plan 跟踪进度；若受单回合步数限制仍未收口且连接了油猴桥，"
-                    "可调用 task_plan(action='schedule_continue', handoff=...) 后立即停笔等待唤醒。"
+                    "可调用 task_plan(action='schedule_continue', handoff=...) 后立即停笔等待唤醒（唤醒消息已内嵌当前与下一步进度，无需再调 task_plan(get)）。"
                     "每次回调的 handoff 必须极简干练（只写下一步动作、文件路径与验收条件，≤120 字，严禁复述历史），避免长会话上下文膨胀。"
                     "【油猴桥接调用协议】若已连接浏览器油猴插件（可用 bridge_status 确认），需要读图/读视频请调 bridge_upload_media，"
                     "需要把网页生成图片/视频/音乐落盘到本机请调 bridge_save_generated_media；"
                     "两者均为异步链路，调用后 Agent 必须立即停止当前回合输出，交由插件完成上传/发送或下载落盘。"
                     "【会话权限边界】当油猴本地桥在线时，各对话窗口权限按会话网页链接独立受控，完全由用户在本地桥面板掌控，不由会话内 Agent 或 Google 掌管。"
                     "【全局白名单目录】用户可在本地桥维护全局白名单（可通过 workspace_status 的 global_whitelist 查看）；白名单内目录在所有未「禁止」的会话中按其权限（readwrite 自由读写 / readonly 仅只读）直接免审批放行，无需每轮单独向用户确认。"
+                    "【目录噪音治理与工作区分离】当 list_dir / find_files / grep_search 命中过多杂项或觉得根目录太乱时，可提醒用户通过油猴「会话工作区」将当前对话切到干净子目录（本架构原生支持按会话隔离工作区），"
+                    "或把噪音目录加入 workspace.ignored_dirs：因 config.json 受本地安全边界保护禁止模型直接改写（若你所在环境确有显式权限才可另行配置），标准做法是调用 bridge_suggest_ignore_dirs(dirs=[...], reason=...) "
+                    "并在正文中写明建议屏蔽的目录名/路径后立即停止当前回合输出，待你停笔后油猴插件会在页面弹窗由用户一键保存并永久生效。"
                     "【动态工作区规则注入】若工作区存在规则文档（AGENTS.md / GEMINI.md / .gemini/rules/*.md），"
-                    "服务端会在会话首次调用任意工具、规则文件发生变动、或达到重锚阈值（默认每 20 步调用或累计 48,000 字符工具输出）时，"
+                    "服务端会在会话首次调用任意工具、规则文件发生变动、或达到重锚阈值（默认每 20 步调用或累计 96,000 字符工具输出）时，"
                     "自动在工具返回末尾附带 <workspace_rules> 块；收到后请将其视为当前工作区的权威约束执行。 "
                     + MEDIA_BOUNDARY_NOTICE + " " + ENV_ADAPT_AND_SAFETY_NOTICE
                 ),
@@ -1807,7 +1923,21 @@ class McpCore:
             )
             if inj:
                 result = dict(result)
-                result["content"] = list(result["content"]) + [{"type": "text", "text": inj["text"]}]
+                content_list = list(result["content"])
+                last_text_idx = None
+                for idx in range(len(content_list) - 1, -1, -1):
+                    item = content_list[idx]
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        last_text_idx = idx
+                        break
+                if last_text_idx is not None:
+                    merged_item = dict(content_list[last_text_idx])
+                    base_text = merged_item.get("text") or ""
+                    merged_item["text"] = f"{base_text}\n\n{inj['text']}" if base_text else inj["text"]
+                    content_list[last_text_idx] = merged_item
+                else:
+                    content_list.append({"type": "text", "text": inj["text"]})
+                result["content"] = content_list
         return result
 
     def _execute_tool(self, name: str, args: dict, *, auth_info: dict, session_key: str, active_ws: Path):
@@ -1894,6 +2024,7 @@ class McpCore:
                     },
                     "extra_allowed_dirs": [str(p) for p in eff_gdirs[1:]],
                     "global_whitelist": self.guard.get_global_whitelist(),
+                    "ignored_dirs": self._effective_ignored_dirs(),
                     "session_trusted_dirs": self.guard.get_session_trusted(),
                     "active_jobs": self.jobs.list_active(),
                     "disk_free_gb": round(usage.free / (1024 ** 3), 2),
@@ -1992,8 +2123,27 @@ class McpCore:
                 else:
                     body = "\n".join(selected)
                 header = f"[path: {p} | encoding: {enc} | lines: {start}-{end}/{total_lines}]\n"
-                guarded, _ = out_guard.format_or_bypass(body, prefix="read")
-                return text_result(header + guarded)
+                if len(body) > out_guard.max_inline_chars:
+                    half_cap = max(200, (out_guard.max_inline_chars - 200) // 2)
+                    h_len = min(out_guard.head_chars, half_cap)
+                    t_len = min(out_guard.tail_chars, half_cap)
+                    if h_len + t_len < len(body):
+                        head = body[:h_len]
+                        tail = body[-t_len:]
+                        middle = body[h_len:len(body) - t_len]
+                        omitted_lines = middle.count("\n")
+                        omitted_chars = len(middle)
+                        head_end_line = start + head.count("\n")
+                        tail_start_line = max(head_end_line, end - tail.count("\n"))
+                        body = (
+                            f"{head}\n\n"
+                            f"... [内容共 {len(body)} 字符，超出 {out_guard.max_inline_chars} 字符上限；"
+                            f"已省略中间约 {omitted_lines} 行（约第 {head_end_line}~{tail_start_line} 行，{omitted_chars} 字符）。"
+                            f"原文件已在磁盘上，无需额外落盘；请直接对原路径 {p} 调用 "
+                            f"read_file(start_line={head_end_line}, end_line={tail_start_line}) 分段读取] ...\n\n"
+                            f"{tail}"
+                        )
+                return text_result(header + body)
 
             if name == "write_file":
                 path_str = args.get("path")
@@ -2036,50 +2186,86 @@ class McpCore:
 
             if name == "edit_file":
                 path_str = args.get("path")
-                old_text = args.get("old_text")
-                new_text = args.get("new_text")
                 if not isinstance(path_str, str) or not path_str.strip():
                     raise ValueError("path is required")
-                if not isinstance(old_text, str) or old_text == "":
-                    raise ValueError("old_text must be a non-empty string")
-                if not isinstance(new_text, str):
-                    raise ValueError("new_text must be a string")
-                replace_all = bool(args.get("replace_all", False))
+                raw_edits = args.get("edits")
+                default_replace_all = bool(args.get("replace_all", False))
+                ops: list[tuple[str, str, bool]] = []
+                if raw_edits is not None:
+                    if args.get("old_text") is not None or args.get("new_text") is not None:
+                        raise ValueError("pass either (old_text, new_text) or edits, not both")
+                    if not isinstance(raw_edits, list) or not raw_edits:
+                        raise ValueError("edits must be a non-empty array of {old_text, new_text}")
+                    for idx, item in enumerate(raw_edits, start=1):
+                        if not isinstance(item, dict):
+                            raise ValueError(f"edits[{idx}] must be an object")
+                        op_old = item.get("old_text")
+                        op_new = item.get("new_text")
+                        if not isinstance(op_old, str) or op_old == "":
+                            raise ValueError(f"edits[{idx}].old_text must be a non-empty string")
+                        if not isinstance(op_new, str):
+                            raise ValueError(f"edits[{idx}].new_text must be a string")
+                        op_ra = bool(item.get("replace_all", default_replace_all))
+                        ops.append((op_old, op_new, op_ra))
+                else:
+                    old_text = args.get("old_text")
+                    new_text = args.get("new_text")
+                    if not isinstance(old_text, str) or old_text == "":
+                        raise ValueError("old_text must be a non-empty string")
+                    if not isinstance(new_text, str):
+                        raise ValueError("new_text must be a string")
+                    ops.append((old_text, new_text, default_replace_all))
+
+                total_old = sum(len(o) for o, _, _ in ops)
+                total_new = sum(len(n) for _, n, _ in ops)
                 p = self.guard.check_write(
                     "edit_file", path_str,
-                    f"replace_all={replace_all}, old_chars={len(old_text)}, new_chars={len(new_text)}",
+                    f"edits={len(ops)}, replace_all={default_replace_all}, old_chars={total_old}, new_chars={total_new}",
                     active_workspace=active_ws,
                 )
                 if not p.is_file():
                     raise ValueError(f"file not found: {p}")
                 text, enc = read_text_auto(p)
-                count = text.count(old_text)
+                had_crlf = "\r\n" in text
+                working = text
                 used_eol_norm = False
-                if count == 0:
-                    # Fallback: normalize CRLF -> LF for matching
-                    had_crlf = "\r\n" in text
-                    norm_text = text.replace("\r\n", "\n")
-                    norm_old = old_text.replace("\r\n", "\n")
-                    norm_new = new_text.replace("\r\n", "\n")
-                    count = norm_text.count(norm_old)
+                total_replaced = 0
+
+                for idx, (op_old, op_new, op_ra) in enumerate(ops, start=1):
+                    prefix = f"edit #{idx}/{len(ops)}: " if len(ops) > 1 else ""
+                    count = working.count(op_old)
                     if count == 0:
-                        raise ValueError("old_text not found in file")
-                    if count > 1 and not replace_all:
-                        raise ValueError(f"old_text matched {count} times; set replace_all=true or provide more context")
-                    updated = norm_text.replace(norm_old, norm_new) if replace_all else norm_text.replace(norm_old, norm_new, 1)
-                    if had_crlf:
-                        updated = updated.replace("\n", "\r\n")
-                    used_eol_norm = True
-                else:
-                    if count > 1 and not replace_all:
-                        raise ValueError(f"old_text matched {count} times; set replace_all=true or provide more context")
-                    updated = text.replace(old_text, new_text) if replace_all else text.replace(old_text, new_text, 1)
+                        norm_text = working.replace("\r\n", "\n")
+                        norm_old = op_old.replace("\r\n", "\n")
+                        norm_new = op_new.replace("\r\n", "\n")
+                        count = norm_text.count(norm_old)
+                        if count == 0:
+                            hints = _suggest_closest_lines(working, op_old, limit=3)
+                            hint_str = f"; closest lines: {', '.join(hints)}" if hints else ""
+                            raise ValueError(f"{prefix}old_text not found in file{hint_str}")
+                        if count > 1 and not op_ra:
+                            raise ValueError(
+                                f"{prefix}old_text matched {count} times; set replace_all=true or provide more context"
+                            )
+                        working = norm_text.replace(norm_old, norm_new) if op_ra else norm_text.replace(norm_old, norm_new, 1)
+                        if had_crlf:
+                            working = working.replace("\n", "\r\n")
+                        used_eol_norm = True
+                    else:
+                        if count > 1 and not op_ra:
+                            raise ValueError(
+                                f"{prefix}old_text matched {count} times; set replace_all=true or provide more context"
+                            )
+                        working = working.replace(op_old, op_new) if op_ra else working.replace(op_old, op_new, 1)
+                    total_replaced += count if op_ra else 1
 
                 snap_path = snap_mgr.backup(p)
                 with open(p, "w", encoding=enc, newline="") as fh:
-                    fh.write(updated)
-                replaced = count if replace_all else 1
-                msg = f"OK: replaced {replaced} occurrence(s) in {p}"
+                    fh.write(working)
+                if len(ops) == 1:
+                    msg = f"OK: replaced {total_replaced} occurrence(s) in {p}"
+                else:
+                    msg = f"OK: applied {len(ops)} edit(s), replaced {total_replaced} occurrence(s) in {p}"
                 if used_eol_norm:
                     msg += " (EOL-normalized)"
                 if snap_path:
@@ -2116,8 +2302,18 @@ class McpCore:
                 recursive = bool(args.get("recursive", False))
                 max_entries = max(1, min(int(args.get("max_entries") or 200), 2000))
                 include_ignored = bool(args.get("include_ignored", False))
-                rows = _list_dir_entries(p, pattern, recursive, max_entries, include_ignored)
-                return text_result("\n".join(rows) if rows else "(empty directory)")
+                rows = _list_dir_entries(
+                    p, pattern, recursive, max_entries, include_ignored,
+                    extra_ignored=self._effective_ignored_dirs(),
+                )
+                raw_body = "\n".join(rows) if rows else "(empty directory)"
+                guarded, _ = out_guard.format_or_bypass(raw_body, prefix="list")
+                if len(rows) >= 80 or (rows and rows[-1].startswith("... [truncated")):
+                    guarded += (
+                        "\n[提示: 当前目录条目较多；若觉得工作区杂乱，可建议用户通过油猴「会话工作区」切到干净子目录，"
+                        "或调用 bridge_suggest_ignore_dirs 推送要屏蔽的目录并在正文中写明路径后停笔，待停止后由油猴弹窗让用户永久保存。]"
+                    )
+                return text_result(guarded)
 
             if name == "find_files":
                 raw_path = str(args.get("path") or ".").strip() or "."
@@ -2128,8 +2324,14 @@ class McpCore:
                     pattern=str(args.get("pattern") or "*"),
                     max_results=int(args.get("max_results") or 200),
                     include_ignored=bool(args.get("include_ignored", False)),
+                    extra_ignored=self._effective_ignored_dirs(),
                 )
                 guarded, _ = out_guard.format_or_bypass(res["text"], prefix="find")
+                if res.get("truncated") or int(res.get("count") or 0) >= 80:
+                    guarded += (
+                        "\n[提示: 检索命中较多；若包含噪音/历史/缓存目录，可建议用户通过油猴「会话工作区」隔离目录，"
+                        "或调用 bridge_suggest_ignore_dirs 推送屏蔽建议并在正文中写明目录后停笔，由用户弹窗永久保存。]"
+                    )
                 return text_result(guarded)
 
             if name == "grep_search":
@@ -2147,6 +2349,8 @@ class McpCore:
                     include=str(args.get("include") or ""),
                     max_matches=int(args.get("max_matches") or 60),
                     context_lines=int(args.get("context_lines") or 0),
+                    include_ignored=bool(args.get("include_ignored", False)),
+                    extra_ignored=self._effective_ignored_dirs(),
                 )
                 guarded, _ = out_guard.format_or_bypass(res["text"], prefix="grep")
                 return text_result(guarded)
@@ -2295,6 +2499,50 @@ class McpCore:
                     raise ValueError(f"unknown task_id: {task_id}")
                 return text_result(json.dumps(task, ensure_ascii=False, indent=2))
 
+            if name == "bridge_suggest_ignore_dirs":
+                raw_dirs = args.get("dirs")
+                if not isinstance(raw_dirs, list) or not raw_dirs:
+                    raise ValueError("dirs must be a non-empty array of directory names or patterns")
+                reason = str(args.get("reason") or "").strip()[:240]
+                cur_ignored = self._effective_ignored_dirs()
+                new_dirs: list[str] = []
+                seen_new: set[str] = set()
+                for item in raw_dirs:
+                    norm = normalize_ignore_entry(str(item or ""))
+                    if not norm:
+                        continue
+                    if is_ignored_dir_name(norm, cur_ignored):
+                        continue
+                    k = norm.lower()
+                    if k not in seen_new:
+                        seen_new.add(k)
+                        new_dirs.append(norm)
+                if not new_dirs:
+                    return text_result(json.dumps({
+                        "ok": True,
+                        "queued": False,
+                        "already_ignored": True,
+                        "ignored_dirs": cur_ignored,
+                        "message": "所提目录已在默认或已配置忽略列表中，无需重复弹窗。",
+                    }, ensure_ascii=False, indent=2))
+                sug = self.bridge.enqueue_ignore_suggestion(
+                    dirs=new_dirs,
+                    reason=reason,
+                    conversation_id=auth_info.get("conversation_id"),
+                    tab_id=auth_info.get("tab_id"),
+                    workspace_dir=str(active_ws),
+                )
+                return text_result(json.dumps({
+                    "ok": True,
+                    "queued": True,
+                    **sug,
+                    "config_path": str(self.config_path),
+                    "instruction": (
+                        "已向油猴端推送目录屏蔽建议。由于 config.json 受本地安全边界保护（禁止模型直接改写），"
+                        "请在正文中写明建议屏蔽的目录及原因后立即停止当前回合；待你停笔后，油猴插件会弹出确认框，由用户一键保存到 config.json 永久生效。"
+                    ),
+                }, ensure_ascii=False, indent=2))
+
             if name == "task_plan":
                 act = str(args.get("action") or "get").strip().lower()
                 cid = auth_info.get("conversation_id")
@@ -2348,14 +2596,17 @@ class McpCore:
                         turn_index=prep["turn_index"],
                         max_auto_turns=prep["max_auto_turns"],
                     )
-                    self.task_plans.record_pending_task_id(cid=cid, tab_id=tab_id, task_id=task["task_id"])
+                    updated_plan = self.task_plans.record_pending_task_id(
+                        cid=cid, tab_id=tab_id, task_id=task["task_id"], handoff=prep["handoff"],
+                    ) or prep["plan"]
                     out = {
                         "ok": True,
+                        "scheduled_turn_index": prep["turn_index"],
                         "task": task,
-                        "plan": prep["plan"],
+                        "plan": updated_plan,
                         "instruction": (
-                            "自唤醒续跑已入队。请立即停止当前回合输出，等待油猴插件在停稳冷却后自动唤醒下一回合。"
-                            "后续回调仍须使用极简干练语言，勿复述历史背景。"
+                            "自唤醒续跑已入队（实际发送成功后计入 auto_turns_used，唤醒提示词已自带当前与下一步进度，无需再调 task_plan(get)）。"
+                            "请立即停止当前回合输出，等待油猴插件在停稳冷却后自动唤醒下一回合；后续回调仍须使用极简干练语言，勿复述历史背景。"
                         ),
                     }
                     return text_result(json.dumps(out, ensure_ascii=False, indent=2))
@@ -3178,6 +3429,9 @@ button{{padding:.5rem 1.2rem;font-size:1rem}}</style></head><body>
                     "default_workspace": str(self.server.core.guard.default_dir),
                 })
                 return
+            if path == "/bridge/ignored_dirs":
+                self._respond_json(200, self.server.core.get_ignored_dirs_snapshot())
+                return
             if path == "/bridge/task_plan":
                 self._respond_json(200, self.server.core.task_plans.snapshot(self.server.core.bridge))
                 return
@@ -3272,6 +3526,12 @@ button{{padding:.5rem 1.2rem;font-size:1rem}}</style></head><body>
                 return
             if path == "/bridge/whitelist":
                 self._handle_bridge_whitelist_post()
+                return
+            if path == "/bridge/ignored_dirs":
+                self._handle_bridge_ignored_dirs_post()
+                return
+            if path == "/bridge/ignored_dirs/decision":
+                self._handle_bridge_ignored_dirs_decision()
                 return
             if path == "/bridge/task_plan":
                 self._handle_bridge_task_plan_post()
@@ -3661,6 +3921,75 @@ button{{padding:.5rem 1.2rem;font-size:1rem}}</style></head><body>
                 return
 
             raise ValueError(f"unsupported action: {action!r}")
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._respond_json(400, {"error": str(exc)})
+
+    def _handle_bridge_ignored_dirs_post(self):
+        try:
+            payload = json.loads(self._read_body() or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("JSON object expected")
+            action = str(payload.get("action") or "add").strip().lower()
+            core = self.server.core
+
+            if action == "pick_folder":
+                if not IS_WINDOWS:
+                    raise ValueError("native folder picker is only available on Windows")
+                chosen = _pick_folder_winforms("选择要加入忽略检索列表的目录（将按目录名屏蔽）", core.guard.default_dir)
+                if chosen is None:
+                    self._respond_json(200, {"cancelled": True, **core.get_ignored_dirs_snapshot()})
+                    return
+                core.add_ignored_dirs([chosen.name])
+                self._respond_json(200, {"cancelled": False, "added": [chosen.name], **core.get_ignored_dirs_snapshot()})
+                return
+
+            if action == "add":
+                raw_list = payload.get("dirs")
+                items: list[str] = []
+                if isinstance(raw_list, list):
+                    items.extend(str(x or "") for x in raw_list)
+                if payload.get("dir"):
+                    items.append(str(payload["dir"]))
+                if not items:
+                    raise ValueError("dir or dirs is required")
+                core.add_ignored_dirs(items)
+                self._respond_json(200, core.get_ignored_dirs_snapshot())
+                return
+
+            if action == "remove":
+                target = str(payload.get("dir") or "").strip()
+                if not target:
+                    raise ValueError("dir is required")
+                core.remove_ignored_dir(target)
+                self._respond_json(200, core.get_ignored_dirs_snapshot())
+                return
+
+            if action == "set":
+                raw_list = payload.get("dirs")
+                if not isinstance(raw_list, list):
+                    raise ValueError("dirs array is required")
+                core.persist_ignored_dirs([str(x or "") for x in raw_list])
+                self._respond_json(200, core.get_ignored_dirs_snapshot())
+                return
+
+            raise ValueError(f"unsupported action: {action!r}")
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._respond_json(400, {"error": str(exc)})
+
+    def _handle_bridge_ignored_dirs_decision(self):
+        try:
+            payload = json.loads(self._read_body() or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("JSON object expected")
+            core = self.server.core
+            res = core.bridge.resolve_ignore_suggestion(
+                suggestion_id=str(payload.get("suggestion_id") or ""),
+                decision=str(payload.get("decision") or ""),
+                dirs=payload.get("dirs") if isinstance(payload.get("dirs"), list) else None,
+            )
+            if res["decision"] == "approve" and res["dirs"]:
+                core.add_ignored_dirs(res["dirs"])
+            self._respond_json(200, {**res, **core.get_ignored_dirs_snapshot()})
         except (ValueError, json.JSONDecodeError) as exc:
             self._respond_json(400, {"error": str(exc)})
 

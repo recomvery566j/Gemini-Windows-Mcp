@@ -5,7 +5,7 @@ responses:
 1. First tool call in a conversation/session injects active workspace rules;
 2. Any content/file change (SHA-256) injects immediately on the next tool call;
 3. Long sessions re-anchor periodically after N tool calls (default 20) OR M
-   cumulative tool output characters (default 48,000), whichever arrives first,
+   cumulative tool output characters (default 96,000), whichever arrives first,
    counteracting random upstream context compaction and attention decay.
 """
 
@@ -33,7 +33,7 @@ DEFAULT_RULE_PATTERNS: tuple[str, ...] = (
 )
 
 DEFAULT_REINJECT_EVERY_CALLS = 20
-DEFAULT_REINJECT_EVERY_OUTPUT_CHARS = 48000
+DEFAULT_REINJECT_EVERY_OUTPUT_CHARS = 96000
 DEFAULT_MAX_TOTAL_CHARS = 24000
 DEFAULT_MAX_FILE_BYTES = 524288
 
@@ -393,13 +393,20 @@ class WorkspaceRulesManager:
                 lines.append(f'<rule_file path="{item["path"]}" omitted="max_total_chars_exceeded" />')
                 continue
             remaining = budget - used
-            truncated_note = ""
+            truncated_note = "\n...[truncated by max_total_chars]..."
             if len(body) > remaining:
-                body = body[: max(0, remaining - 64)].rstrip()
-                truncated_note = "\n...[truncated by max_total_chars]..."
-            used += len(body)
+                if remaining <= len(truncated_note):
+                    lines.append(f'<rule_file path="{item["path"]}" omitted="max_total_chars_exceeded" />')
+                    used = budget
+                    continue
+                keep = remaining - len(truncated_note)
+                body = body[:keep].rstrip()
+                chunk = body + truncated_note
+            else:
+                chunk = body
+            used += len(chunk)
             lines.append(f'<rule_file path="{item["path"]}" sha256="{item["sha256_prefix"]}">')
-            lines.append(body + truncated_note)
+            lines.append(chunk)
             lines.append("</rule_file>")
         lines.append("</workspace_rules>")
         return "\n".join(lines)

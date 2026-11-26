@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+
+try:
+    import tomllib  # Python 3.11+
+except ImportError:  # pragma: no cover - Python 3.10 fallback
+    tomllib = None  # type: ignore[assignment]
 
 from output_guard import OutputGuard
 
@@ -83,6 +89,67 @@ class PostEditChecker:
                 }
             except Exception as exc:  # noqa: BLE001
                 return {"check": "json_syntax", "ok": False, "file": str(file_path), "message": str(exc)}
+
+        if ext == ".toml" and tomllib is not None:
+            try:
+                source = file_path.read_text(encoding="utf-8-sig")
+                tomllib.loads(source)
+                return {"check": "toml_syntax", "ok": True}
+            except tomllib.TOMLDecodeError as exc:
+                out_err: dict[str, Any] = {
+                    "check": "toml_syntax",
+                    "ok": False,
+                    "file": str(file_path),
+                    "message": str(exc),
+                }
+                if getattr(exc, "lineno", None) is not None:
+                    out_err["line"] = exc.lineno
+                if getattr(exc, "colno", None) is not None:
+                    out_err["col"] = exc.colno
+                return out_err
+            except Exception as exc:  # noqa: BLE001
+                return {"check": "toml_syntax", "ok": False, "file": str(file_path), "message": str(exc)}
+
+        if ext in (".ps1", ".psm1", ".psd1"):
+            pwsh = getattr(self.runner, "pwsh_exe", "") or ""
+            if not pwsh:
+                return None
+            try:
+                ps_cmd = (
+                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+                    "$p = $env:PCM_CHECK_PS1; "
+                    "$c = [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8); "
+                    "$tok = $null; $err = $null; "
+                    "[void][System.Management.Automation.Language.Parser]::ParseInput($c, $p, [ref]$tok, [ref]$err); "
+                    "if ($err -and $err.Count -gt 0) { "
+                    "  $err | Select-Object -First 8 | ForEach-Object { "
+                    "    $ex = $_.Extent; "
+                    "    Write-Output ('L{0}:C{1} [{2}] {3}' -f $ex.StartLineNumber, $ex.StartColumnNumber, $_.ErrorId, $_.Message) "
+                    "  }; exit 1 "
+                    "}; exit 0"
+                )
+                env = dict(os.environ)
+                env["PCM_CHECK_PS1"] = str(file_path)
+                proc = subprocess.run(
+                    [pwsh, "-NoProfile", "-Command", ps_cmd],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    timeout=5,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if proc.returncode == 0:
+                    return {"check": "powershell_syntax", "ok": True}
+                err_txt = (proc.stdout or proc.stderr or b"").decode("utf-8", "replace")
+                return {
+                    "check": "powershell_syntax",
+                    "ok": False,
+                    "file": str(file_path),
+                    "exit_code": proc.returncode,
+                    "error_lines": _extract_error_lines(err_txt, max_lines=12, max_chars=1200),
+                }
+            except Exception:  # noqa: BLE001
+                return None
 
         if ext in (".js", ".mjs", ".cjs") and self._node_exe:
             try:

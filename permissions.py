@@ -32,8 +32,8 @@ ALL_CAPABILITIES: tuple[str, ...] = (
 )
 
 CAPABILITY_LABELS: dict[str, str] = {
-    "read": "读取文件/图片/目录",
-    "write": "写入工作区/推送文件",
+    "read": "读取文件/图片/目录与推送下载",
+    "write": "写入/编辑工作区与任务计划",
     "exec": "执行本机命令 (PS/Python/Bash)",
     "bridge_read": "桥接上传本机媒体到会话",
     "bridge_save": "桥接下载网页生成媒体落盘",
@@ -52,9 +52,9 @@ TOOL_CAPABILITY: dict[str, str] = {
     "list_dir": "read",
     "find_files": "read",
     "grep_search": "read",
+    "push_file": "read",
     "write_file": "write",
     "edit_file": "write",
-    "push_file": "write",
     "task_plan": "write",
     "powershell": "exec",
     "python": "exec",
@@ -63,6 +63,7 @@ TOOL_CAPABILITY: dict[str, str] = {
     "kill_job": "exec",
     "bridge_upload_media": "bridge_read",
     "bridge_save_generated_media": "bridge_save",
+    "bridge_suggest_ignore_dirs": "read",
 }
 
 PERMISSION_PROFILES: dict[str, tuple[str, ...]] = {
@@ -511,7 +512,7 @@ class ConversationPermissionManager:
             return False
         a = args or {}
 
-        if tool_name in ("read_file", "read_image", "list_dir"):
+        if tool_name in ("read_file", "read_image", "list_dir", "push_file"):
             raw_path = str(a.get("path") or "").strip()
             return bool(raw_path) and guard.is_whitelisted_for_action(
                 raw_path, access="read", active_workspace=active_ws,
@@ -539,7 +540,7 @@ class ConversationPermissionManager:
                 for p in cleaned
             )
 
-        if tool_name in ("write_file", "edit_file", "push_file"):
+        if tool_name in ("write_file", "edit_file"):
             raw_path = str(a.get("path") or "").strip()
             return bool(raw_path) and guard.is_whitelisted_for_action(
                 raw_path, access="write", active_workspace=active_ws,

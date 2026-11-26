@@ -18,10 +18,48 @@ DEFAULT_IGNORED_DIRS = frozenset({
     ".tmp_outputs",
     ".pytest_cache",
     ".mypy_cache",
+    ".brave-agent-profile",
+    ".gemini-profile-backup",
 })
 
 MAX_FILE_BYTES = 2 * 1024 * 1024  # Skip >2MB files during grep
 MAX_LINE_CHARS = 300
+
+
+def normalize_ignore_entry(raw: str) -> str:
+    """Normalize a user/agent ignore entry to a clean directory name or glob pattern."""
+    s = str(raw or "").strip()
+    if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+        s = s[1:-1].strip()
+    if not s:
+        return ""
+    norm_sep = s.replace("\\", "/").rstrip("/")
+    if not norm_sep:
+        return ""
+    if "/" in norm_sep:
+        norm_sep = norm_sep.rsplit("/", 1)[-1].strip()
+    if norm_sep in ("", ".", ".."):
+        return ""
+    return norm_sep
+
+
+def is_ignored_dir_name(
+    name: str,
+    extra_ignored: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> bool:
+    """Return True if directory `name` matches built-in or configured ignore patterns."""
+    if name in DEFAULT_IGNORED_DIRS:
+        return True
+    for pat in extra_ignored or ():
+        p = str(pat or "").strip()
+        if not p:
+            continue
+        if any(ch in p for ch in "*?["):
+            if fnmatch.fnmatch(name, p):
+                return True
+        elif name.lower() == p.lower():
+            return True
+    return False
 
 
 def _read_text_for_search(path: Path) -> str | None:
@@ -55,7 +93,12 @@ def _matches_pattern(rel_posix: str, filename: str, pattern: str) -> bool:
     return fnmatch.fnmatch(filename, pat_norm)
 
 
-def _iter_files(target: Path, *, include_ignored: bool = False):
+def _iter_files(
+    target: Path,
+    *,
+    include_ignored: bool = False,
+    extra_ignored: list[str] | tuple[str, ...] | set[str] | None = None,
+):
     if target.is_file():
         yield target
         return
@@ -63,7 +106,7 @@ def _iter_files(target: Path, *, include_ignored: bool = False):
         return
     for dirpath, dirnames, filenames in os.walk(target):
         if not include_ignored:
-            dirnames[:] = sorted(d for d in dirnames if d not in DEFAULT_IGNORED_DIRS)
+            dirnames[:] = sorted(d for d in dirnames if not is_ignored_dir_name(d, extra_ignored))
         else:
             dirnames.sort()
         for fname in sorted(filenames):
@@ -77,6 +120,7 @@ def find_files(
     pattern: str = "*",
     max_results: int = 200,
     include_ignored: bool = False,
+    extra_ignored: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Find files matching glob pattern under `target` without invoking a shell."""
     if not target.exists():
@@ -86,7 +130,7 @@ def find_files(
 
     matches: list[str] = []
     truncated = False
-    for fpath in _iter_files(target, include_ignored=include_ignored):
+    for fpath in _iter_files(target, include_ignored=include_ignored, extra_ignored=extra_ignored):
         try:
             rel_posix = fpath.relative_to(target if target.is_dir() else root).as_posix()
         except ValueError:
@@ -128,6 +172,7 @@ def grep_search(
     max_matches: int = 60,
     context_lines: int = 0,
     include_ignored: bool = False,
+    extra_ignored: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Search file contents inside `target` using literal substring or regex."""
     if not target.exists():
@@ -150,7 +195,7 @@ def grep_search(
     truncated = False
     out_lines: list[str] = []
 
-    for fpath in _iter_files(target, include_ignored=include_ignored):
+    for fpath in _iter_files(target, include_ignored=include_ignored, extra_ignored=extra_ignored):
         try:
             rel_posix = fpath.relative_to(target if target.is_dir() else root).as_posix()
         except ValueError:

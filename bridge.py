@@ -50,6 +50,7 @@ class BridgeManager:
         self.lock = threading.Lock()
         self.tabs: dict[str, dict[str, Any]] = {}
         self.tasks: dict[str, dict[str, Any]] = {}
+        self.ignore_suggestions: dict[str, dict[str, Any]] = {}
         self.active_tab_id: str | None = None
         self.active_conversation_id: str | None = None
 
@@ -69,6 +70,13 @@ class BridgeManager:
         ]
         for kid in stale_tasks:
             self.tasks.pop(kid, None)
+
+        stale_sugs = [
+            sid for sid, s in self.ignore_suggestions.items()
+            if (now - s["created_at"]) > 600.0
+        ]
+        for sid in stale_sugs:
+            self.ignore_suggestions.pop(sid, None)
 
     def heartbeat(self, payload: dict[str, Any]) -> dict[str, Any]:
         tab_id = str(payload.get("tab_id") or "").strip()
@@ -137,6 +145,12 @@ class BridgeManager:
                             task["status"] = "queued"
                             task["updated_at"] = now
                             resolved_ids.append(task["task_id"])
+                for sug in self.ignore_suggestions.values():
+                    if not sug.get("conversation_id") and (
+                        sug.get("tab_id") == tab_id or not sug.get("tab_id") or sug.get("tab_id") not in self.tabs
+                    ):
+                        sug["conversation_id"] = cid
+                        sug["tab_id"] = tab_id
 
         effective_policy = None
         pending_approvals: list[dict[str, Any]] = []
@@ -194,6 +208,7 @@ class BridgeManager:
             "per_conversation_enabled": bool(self.permission_mgr and self.permission_mgr.enabled),
             "effective_policy": effective_policy,
             "pending_approvals": pending_approvals,
+            "pending_ignore_suggestions": self.list_pending_ignore_suggestions(tab_id, cid),
             "rules_status": rules_status,
             "workspace_binding": workspace_binding,
             "task_plan": task_plan_view,
@@ -515,6 +530,7 @@ class BridgeManager:
                     self.permission_mgr.list_pending_for_tab(tab_id, cid)
                     if self.permission_mgr is not None else []
                 ),
+                "pending_ignore_suggestions": self._list_pending_ignore_suggestions_locked(tab_id, cid, now),
             }
 
     def get_upload_file(self, task_id: str, index: int) -> dict[str, Any] | None:
@@ -618,7 +634,9 @@ class BridgeManager:
             and status in ("completed", "failed", "cancelled")
             and self.task_plan_mgr is not None
         ):
-            self.task_plan_mgr.record_pending_task_id(cid=task_cid, tab_id=task_tab, task_id=None)
+            self.task_plan_mgr.mark_continue_result(
+                cid=task_cid, tab_id=task_tab, task_id=task_id, status=status,
+            )
         return pub
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
@@ -669,6 +687,84 @@ class BridgeManager:
                 "tabs": tabs,
                 "tasks": recent_tasks,
             }
+
+    def enqueue_ignore_suggestion(
+        self,
+        *,
+        dirs: list[str],
+        reason: str = "",
+        conversation_id: str | None = None,
+        tab_id: str | None = None,
+        workspace_dir: str = "",
+    ) -> dict[str, Any]:
+        now = time.time()
+        sug_id = "ign_" + uuid.uuid4().hex[:12]
+        clean_dirs = [str(d).strip() for d in dirs if str(d).strip()]
+        with self.lock:
+            self._prune_locked(now)
+            target_cid = str(conversation_id or "").strip() or None
+            target_tab = str(tab_id or "").strip() or None
+            if not target_cid and not target_tab:
+                target_cid, target_tab, _ = self._pick_target_locked(None)
+            rec = {
+                "suggestion_id": sug_id,
+                "dirs": clean_dirs,
+                "reason": str(reason or "").strip(),
+                "workspace_dir": str(workspace_dir or ""),
+                "conversation_id": target_cid,
+                "tab_id": target_tab,
+                "created_at": now,
+            }
+            self.ignore_suggestions[sug_id] = rec
+            return dict(rec)
+
+    def _list_pending_ignore_suggestions_locked(self, tab_id: str, cid: str | None, now: float) -> list[dict[str, Any]]:
+        clean_tab = str(tab_id or "").strip()
+        clean_cid = str(cid or "").strip() or None
+        self._prune_locked(now)
+        out: list[dict[str, Any]] = []
+        for rec in sorted(self.ignore_suggestions.values(), key=lambda r: r["created_at"]):
+            rcid = rec.get("conversation_id")
+            rtab = rec.get("tab_id")
+            if clean_cid and rcid:
+                matched = (rcid == clean_cid)
+            elif not rcid:
+                matched = (rtab == clean_tab or not rtab or rtab not in self.tabs)
+            else:
+                matched = False
+            if matched:
+                out.append(dict(rec))
+        return out
+
+    def list_pending_ignore_suggestions(self, tab_id: str, cid: str | None) -> list[dict[str, Any]]:
+        now = time.time()
+        with self.lock:
+            return self._list_pending_ignore_suggestions_locked(tab_id, cid, now)
+
+    def resolve_ignore_suggestion(
+        self,
+        *,
+        suggestion_id: str,
+        decision: str,
+        dirs: list[str] | None = None,
+    ) -> dict[str, Any]:
+        sid = str(suggestion_id or "").strip()
+        dec = str(decision or "").strip().lower()
+        if not sid or dec not in ("approve", "dismiss"):
+            raise ValueError("suggestion_id and valid decision ('approve'/'dismiss') are required")
+        with self.lock:
+            rec = self.ignore_suggestions.pop(sid, None)
+        if not rec:
+            raise ValueError(f"unknown or expired suggestion_id: {sid}")
+        chosen = list(rec.get("dirs") or [])
+        if dirs is not None:
+            chosen = [str(d).strip() for d in dirs if str(d).strip()]
+        return {
+            "ok": True,
+            "suggestion_id": sid,
+            "decision": dec,
+            "dirs": chosen if dec == "approve" else [],
+        }
 
     @staticmethod
     def _public_task(task: dict[str, Any]) -> dict[str, Any]:

@@ -13,6 +13,7 @@
     "initialized": false,
     "default_dir": "",
     "extra_allowed_dirs": [],
+    "ignored_dirs": [],
     "blocked_read_prefixes": [
       "C:\\Windows\\System32",
       "%LOCALAPPDATA%\\Google\\Chrome\\User Data"
@@ -57,7 +58,7 @@
   "workspace_rules": {
     "enabled": true,
     "reinject_every_calls": 20,
-    "reinject_every_output_chars": 48000,
+    "reinject_every_output_chars": 96000,
     "max_total_chars": 24000,
     "patterns": [
       "AGENTS.md",

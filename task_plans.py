@@ -279,6 +279,23 @@ class TaskPlanManager:
             )
         return {"ok": True, "cancelled_task_ids": cancelled_ids, "plan": view}
 
+    @staticmethod
+    def _build_step_context(steps: list[dict[str, Any]]) -> tuple[str, str]:
+        done_cnt = sum(1 for s in steps if s.get("status") == "done")
+        progress = f"{done_cnt}/{len(steps)}" if steps else "0/0"
+        in_prog = [s for s in steps if s.get("status") == "in_progress"]
+        pending = [s for s in steps if s.get("status") == "pending"]
+        parts: list[str] = []
+        if in_prog:
+            cur = ", ".join(f"#{s['id']}:{_clip_text(s.get('title') or '', 28)}" for s in in_prog[:2])
+            parts.append(f"进行中[{cur}]")
+        if pending:
+            nxt = pending[0]
+            parts.append(f"下步待办[#{nxt['id']}:{_clip_text(nxt.get('title') or '', 28)}]")
+        if not parts:
+            parts.append("步骤均已收口" if steps else "无预设步骤")
+        return progress, " ".join(parts)
+
     def prepare_continue(
         self,
         *,
@@ -309,16 +326,13 @@ class TaskPlanManager:
                 )
 
             next_num = used + 1
-            plan["auto_turns_used"] = next_num
-            plan["last_handoff"] = clean_handoff
-            plan["updated_at"] = time.time()
             goal_short = _clip_text(plan.get("goal", ""), 60)
+            progress, step_ctx = self._build_step_context(list(plan.get("steps") or []))
             prompt = (
-                f"[续跑 {next_num}/{max_turns}] 目标:{goal_short} | "
-                f"下一步:{clean_handoff} "
-                f"(先简短调 task_plan(action='get') 对齐进度，完成后简短汇报，勿复述历史)"
+                f"[续跑 {next_num}/{max_turns} · 进度 {progress}] 目标:{goal_short} | "
+                f"{step_ctx} | 下一步:{clean_handoff} "
+                f"(无需再调 task_plan(get)，直接继续执行，完成后简短汇报，勿复述历史)"
             )
-            self._put_locked(cid, tab_id, plan)
             return {
                 "turn_index": next_num,
                 "max_auto_turns": max_turns,
@@ -328,14 +342,49 @@ class TaskPlanManager:
                 "plan": self._compact_view(plan),
             }
 
-    def record_pending_task_id(self, *, cid: str | None, tab_id: str | None, task_id: str | None) -> None:
+    def record_pending_task_id(
+        self,
+        *,
+        cid: str | None,
+        tab_id: str | None,
+        task_id: str | None,
+        handoff: str | None = None,
+    ) -> dict[str, Any] | None:
         with self.lock:
             plan = self._get_locked(cid, tab_id)
             if not plan:
-                return
+                return None
             plan["pending_continue_task_id"] = task_id
+            if handoff:
+                plan["last_handoff"] = _clip_text(handoff, self.max_handoff_chars)
             plan["updated_at"] = time.time()
             self._put_locked(cid, tab_id, plan)
+            return self._compact_view(plan)
+
+    def mark_continue_result(
+        self,
+        *,
+        cid: str | None,
+        tab_id: str | None,
+        task_id: str,
+        status: str,
+    ) -> dict[str, Any] | None:
+        """Finalize continue_turn result; count quota only when wake-up actually completed."""
+        with self.lock:
+            plan = self._get_locked(cid, tab_id)
+            if not plan:
+                return None
+            if plan.get("pending_continue_task_id") == task_id:
+                plan["pending_continue_task_id"] = None
+            if status == "completed":
+                counted = list(plan.get("_counted_task_ids") or [])
+                if task_id not in counted:
+                    plan["auto_turns_used"] = int(plan.get("auto_turns_used", 0)) + 1
+                    counted.append(task_id)
+                    plan["_counted_task_ids"] = counted[-20:]
+            plan["updated_at"] = time.time()
+            self._put_locked(cid, tab_id, plan)
+            return self._compact_view(plan)
 
     def snapshot(self, bridge_mgr=None) -> dict[str, Any]:
         tab_plans: dict[str, Any] = {}

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pc-work-mcp Gemini Bridge
 // @namespace    https://pc-work-mcp.local/
-// @version      1.1.0
+// @version      1.2.0
 // @description  连接 Gemini 网页端与本地 pc-work-mcp：实时同步会话 ID（含首轮异步捕获）、监听文件上传完成自动发送、将网页端生成的图片/视频/音乐下载落盘到指定目录。
 // @match        https://gemini.google.com/*
 // @grant        GM_xmlhttpRequest
@@ -452,9 +452,53 @@
     if (!promptText) return;
     const box = getEditorBox();
     if (!box) throw new Error('未找到 Gemini 输入框');
+    const textVal = String(promptText);
+    const norm = (s) => String(s || '').replace(/\u200b/g, '').trim();
+    const isTextArea = box.tagName === 'TEXTAREA' || box.tagName === 'INPUT';
+    const before = isTextArea ? norm(box.value) : norm(box.textContent);
+
     box.focus();
-    document.execCommand('insertText', false, promptText);
-    box.dispatchEvent(new Event('input', { bubbles: true }));
+    try {
+      document.execCommand('insertText', false, textVal);
+    } catch (_) {}
+
+    const afterExec = isTextArea ? norm(box.value) : norm(box.textContent);
+    const probe = norm(textVal).slice(0, 24);
+    const insertedOk =
+      afterExec !== before && (!probe || afterExec.includes(probe));
+
+    if (!insertedOk) {
+      if (isTextArea) {
+        box.value = before ? `${box.value}\n${textVal}` : textVal;
+      } else {
+        // Gemini Web enforces TrustedHTML: create <p> via DOM APIs without touching innerHTML.
+        if (before === '' || (box.classList && box.classList.contains('ql-blank'))) {
+          while (box.firstChild) box.removeChild(box.firstChild);
+        }
+        const frag = document.createDocumentFragment();
+        const lines = textVal.split(/\r?\n/);
+        for (const line of lines) {
+          const p = document.createElement('p');
+          if (line === '') {
+            p.appendChild(document.createElement('br'));
+          } else {
+            p.textContent = line;
+          }
+          frag.appendChild(p);
+        }
+        box.appendChild(frag);
+        if (box.classList) box.classList.remove('ql-blank');
+      }
+      try {
+        box.dispatchEvent(new InputEvent('input', { bubbles: true, data: textVal, inputType: 'insertText' }));
+      } catch (_) {
+        box.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+      box.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: ' ' }));
+    } else {
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+    }
     await sleep(250);
   }
 
@@ -892,6 +936,8 @@
   let currentWorkspace = null;
   let currentTaskPlan = null;
   let activeApprovals = [];
+  let activeIgnoreSuggestions = [];
+  let refreshOpenModalIgnoredFn = null;
 
   const PROFILE_SHORT = {
     ask: '询问',
@@ -913,8 +959,8 @@
   ];
 
   const CAP_OPTIONS = [
-    { id: 'read', label: '读取文件/图片/目录' },
-    { id: 'write', label: '写入工作区/推送文件' },
+    { id: 'read', label: '读取文件/图片/目录与推送下载' },
+    { id: 'write', label: '写入/编辑工作区与任务计划' },
     { id: 'exec', label: '执行命令 (PS/Python/Bash)' },
     { id: 'bridge_read', label: '桥接上传本机媒体' },
     { id: 'bridge_save', label: '桥接保存网页生成媒体' },
@@ -939,8 +985,11 @@
     }
     if (Array.isArray(resp.pending_approvals)) {
       activeApprovals = resp.pending_approvals;
-      syncApprovalCards();
     }
+    if (Array.isArray(resp.pending_ignore_suggestions)) {
+      activeIgnoreSuggestions = resp.pending_ignore_suggestions;
+    }
+    syncApprovalCards();
   }
 
   async function sendHeartbeat(force = false) {
@@ -949,6 +998,7 @@
       bridgeConnected = false;
       currentPolicy = null;
       activeApprovals = [];
+      activeIgnoreSuggestions = [];
       syncApprovalCards();
       updatePill();
       return;
@@ -1157,8 +1207,33 @@
     await sendHeartbeat(true);
   }
 
+  async function submitIgnoreDecision(suggestionId, decision, dirs) {
+    try {
+      const snap = await mcpJson('POST', '/bridge/ignored_dirs/decision', {
+        suggestion_id: suggestionId,
+        decision,
+        dirs,
+      });
+      if (decision === 'approve') {
+        setPillStatus('已永久写入忽略目录', '#06b6d4');
+      }
+      if (typeof refreshOpenModalIgnoredFn === 'function' && snap) {
+        refreshOpenModalIgnoredFn(snap);
+      }
+    } catch (err) {
+      setPillStatus('保存忽略目录失败: ' + String(err && err.message ? err.message : err).slice(0, 24), '#ef4444');
+    }
+    activeIgnoreSuggestions = activeIgnoreSuggestions.filter((s) => s.suggestion_id !== suggestionId);
+    syncApprovalCards();
+    await sendHeartbeat(true);
+  }
+
   function syncApprovalCards() {
-    if (!activeApprovals || activeApprovals.length === 0) {
+    const readySuggestions = !isGenerating() ? (activeIgnoreSuggestions || []) : [];
+    const hasApprovals = activeApprovals && activeApprovals.length > 0;
+    const hasSuggestions = readySuggestions.length > 0;
+
+    if (!hasApprovals && !hasSuggestions) {
       if (approvalHost) {
         approvalHost.remove();
         approvalHost = null;
@@ -1173,7 +1248,10 @@
       return;
     }
 
-    const sig = activeApprovals.map((a) => a.approval_id).join(',');
+    const sig =
+      (activeApprovals || []).map((a) => a.approval_id).join(',') +
+      '|' +
+      readySuggestions.map((s) => s.suggestion_id).join(',');
     if (sig === approvalSig && approvalHost && approvalHost.isConnected) {
       return;
     }
@@ -1354,15 +1432,145 @@
       wrap.appendChild(card);
     }
 
+    for (const sug of readySuggestions) {
+      const card = document.createElement('div');
+      Object.assign(card.style, {
+        background: '#18181b',
+        color: '#f4f4f5',
+        border: '1px solid #06b6d4',
+        borderRadius: '12px',
+        padding: '14px',
+        boxShadow: '0 10px 30px rgba(0,0,0,0.55)',
+        fontSize: '12px',
+        lineHeight: '1.5',
+      });
+
+      const hdr = document.createElement('div');
+      Object.assign(hdr.style, {
+        fontWeight: '600',
+        fontSize: '13px',
+        color: '#22d3ee',
+        marginBottom: '6px',
+      });
+      hdr.textContent = '🧹 工作区目录屏蔽建议 · 保存后永久写入 config.json';
+      card.appendChild(hdr);
+
+      if (sug.workspace_dir || sug.reason) {
+        const sub = document.createElement('div');
+        Object.assign(sub.style, {
+          background: '#27272a',
+          borderRadius: '8px',
+          padding: '7px 9px',
+          marginBottom: '8px',
+          color: '#d4d4d8',
+          fontSize: '11px',
+          wordBreak: 'break-all',
+        });
+        const parts = [];
+        if (sug.workspace_dir) parts.push(`工作区: ${sug.workspace_dir}`);
+        if (sug.reason) parts.push(`原因: ${sug.reason}`);
+        sub.textContent = parts.join('\n');
+        sub.style.whiteSpace = 'pre-line';
+        card.appendChild(sub);
+      }
+
+      const dirChecks = [];
+      const dirList = document.createElement('div');
+      Object.assign(dirList.style, {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '5px',
+        marginBottom: '10px',
+        maxHeight: '140px',
+        overflowY: 'auto',
+      });
+      for (const d of (sug.dirs || [])) {
+        const lbl = document.createElement('label');
+        Object.assign(lbl.style, {
+          display: 'flex',
+          alignItems: 'center',
+          gap: '6px',
+          cursor: 'pointer',
+          background: '#111214',
+          padding: '5px 8px',
+          borderRadius: '6px',
+        });
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.checked = true;
+        const txt = document.createElement('span');
+        txt.textContent = d;
+        txt.style.color = '#67e8f9';
+        txt.style.fontFamily = 'monospace';
+        lbl.appendChild(chk);
+        lbl.appendChild(txt);
+        dirList.appendChild(lbl);
+        dirChecks.push({ dir: d, chk });
+      }
+      card.appendChild(dirList);
+
+      const btnRow = document.createElement('div');
+      Object.assign(btnRow.style, { display: 'flex', gap: '6px', flexWrap: 'wrap' });
+
+      const btnApprove = document.createElement('button');
+      btnApprove.textContent = '💾 保存选中项并永久生效';
+      Object.assign(btnApprove.style, {
+        padding: '6px 10px',
+        borderRadius: '6px',
+        border: 'none',
+        background: '#0891b2',
+        color: '#ffffff',
+        fontSize: '12px',
+        cursor: 'pointer',
+      });
+
+      const btnDismiss = document.createElement('button');
+      btnDismiss.textContent = '忽略建议';
+      Object.assign(btnDismiss.style, {
+        padding: '6px 10px',
+        borderRadius: '6px',
+        border: '1px solid #52525b',
+        background: 'transparent',
+        color: '#e4e4e7',
+        fontSize: '12px',
+        cursor: 'pointer',
+      });
+
+      btnApprove.addEventListener('click', async () => {
+        btnApprove.disabled = true;
+        btnDismiss.disabled = true;
+        const picked = dirChecks.filter((x) => x.chk.checked).map((x) => x.dir);
+        if (picked.length === 0) {
+          await submitIgnoreDecision(sug.suggestion_id, 'dismiss', []);
+          return;
+        }
+        await submitIgnoreDecision(sug.suggestion_id, 'approve', picked);
+      });
+      btnDismiss.addEventListener('click', async () => {
+        btnApprove.disabled = true;
+        btnDismiss.disabled = true;
+        await submitIgnoreDecision(sug.suggestion_id, 'dismiss', []);
+      });
+
+      btnRow.appendChild(btnApprove);
+      btnRow.appendChild(btnDismiss);
+      card.appendChild(btnRow);
+      wrap.appendChild(card);
+    }
+
     approvalRoot.appendChild(wrap);
 
     if (approvalTickTimer) clearInterval(approvalTickTimer);
-    approvalTickTimer = setInterval(() => {
-      for (const item of countdownLabels) {
-        const rem = Math.max(0, Math.ceil((approvalDeadlines.get(item.id) - Date.now()) / 1000));
-        item.el.textContent = `${rem}s`;
-      }
-    }, 500);
+    if (countdownLabels.length > 0) {
+      approvalTickTimer = setInterval(() => {
+        for (const item of countdownLabels) {
+          const rem = Math.max(0, Math.ceil((approvalDeadlines.get(item.id) - Date.now()) / 1000));
+          item.el.textContent = `${rem}s`;
+        }
+      }, 500);
+    } else {
+      approvalTickTimer = null;
+    }
   }
 
   function ensurePill() {
@@ -1846,6 +2054,64 @@
     wlBox.appendChild(wlOptsRow);
     wlBox.appendChild(wlBtnRow);
 
+    // --- Section 2.7: 忽略检索目录（workspace.ignored_dirs，即时热生效） ---
+    const ignBox = document.createElement('div');
+    Object.assign(ignBox.style, {
+      background: '#111214',
+      borderRadius: '8px',
+      padding: '10px',
+      marginBottom: '8px',
+      fontSize: '12px',
+    });
+
+    const ignInfoMsg = document.createElement('div');
+    ignInfoMsg.textContent =
+      '此处填入目录名或通配符（如 logs、outbox、pc-work-mcp-v*，也可粘贴完整路径自动提取目录名），' +
+      'list_dir / find_files / grep_search 默认跳过这些目录并永久写入 config.json。';
+    Object.assign(ignInfoMsg.style, { color: '#a1a1aa', lineHeight: '1.5', fontSize: '11px', marginBottom: '6px' });
+
+    const ignDefaultMsg = document.createElement('div');
+    ignDefaultMsg.textContent = '内置默认屏蔽: .git, node_modules, __pycache__, .venv, .brave-agent-profile 等';
+    Object.assign(ignDefaultMsg.style, { color: '#71717a', lineHeight: '1.4', fontSize: '11px', marginBottom: '8px' });
+
+    const ignListEl = document.createElement('div');
+    Object.assign(ignListEl.style, {
+      maxHeight: '130px',
+      overflowY: 'auto',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '5px',
+      marginBottom: '8px',
+    });
+
+    const inpIgnDir = document.createElement('input');
+    inpIgnDir.type = 'text';
+    inpIgnDir.placeholder = '输入目录名、通配符（如 pc-work-mcp-v*）或粘贴路径（支持逗号分隔多项）';
+    Object.assign(inpIgnDir.style, {
+      width: '100%',
+      boxSizing: 'border-box',
+      padding: '7px 8px',
+      borderRadius: '6px',
+      border: '1px solid #3f3f46',
+      background: '#18181b',
+      color: '#fafafa',
+      fontSize: '12px',
+      marginBottom: '8px',
+    });
+
+    const ignBtnRow = document.createElement('div');
+    Object.assign(ignBtnRow.style, { display: 'flex', gap: '6px', flexWrap: 'wrap' });
+    const btnPickIgnFolder = mkSmallBtn('📂 选目录加入忽略', '#059669');
+    const btnAddIgn = mkSmallBtn('➕ 添加忽略规则', '#0891b2');
+    ignBtnRow.appendChild(btnPickIgnFolder);
+    ignBtnRow.appendChild(btnAddIgn);
+
+    ignBox.appendChild(ignInfoMsg);
+    ignBox.appendChild(ignDefaultMsg);
+    ignBox.appendChild(ignListEl);
+    ignBox.appendChild(inpIgnDir);
+    ignBox.appendChild(ignBtnRow);
+
     // 公网入口外网双栈 TCP 自检区（默认启动不卡死；配置好域名/反代后，在接入 Google MCP 前自己测通不通）
     const pubBox = document.createElement('div');
     Object.assign(pubBox.style, {
@@ -1997,7 +2263,7 @@
       const callPart = remCalls !== null && remCalls !== undefined
         ? `${ses.calls_since_inject || 0}/${rs.reinject_every_calls || 20} 步`
         : `${ses.calls_since_inject || 0} 步`;
-      const charPart = `${ses.output_chars_since_inject || 0}/${rs.reinject_every_output_chars || 48000} 字`;
+      const charPart = `${ses.output_chars_since_inject || 0}/${rs.reinject_every_output_chars || 96000} 字`;
       if (!files) {
         rulesInfoMsg.textContent = '规则注入: 当前工作区暂无 AGENTS.md / GEMINI.md / .gemini/rules/*.md（新建后下轮调工具自动注入）';
         rulesInfoMsg.style.color = '#71717a';
@@ -2241,17 +2507,72 @@
       }
     }
 
+    function renderIgnoredDirsPanel(ignSnap) {
+      if (!ignSnap) return;
+      if (Array.isArray(ignSnap.default_ignored) && ignSnap.default_ignored.length > 0) {
+        ignDefaultMsg.textContent = `内置默认屏蔽 (${ignSnap.default_ignored.length}): ${ignSnap.default_ignored.join(', ')}`;
+      }
+      while (ignListEl.firstChild) ignListEl.removeChild(ignListEl.firstChild);
+      const dirs = ignSnap.ignored_dirs || [];
+      if (dirs.length === 0) {
+        const emptyIgn = document.createElement('div');
+        emptyIgn.textContent = '暂无自定义忽略目录（可在下方添加，或在模型发现根目录杂乱后通过弹窗一键保存）。';
+        emptyIgn.style.color = '#71717a';
+        emptyIgn.style.fontSize = '11px';
+        ignListEl.appendChild(emptyIgn);
+        return;
+      }
+      for (const dirName of dirs) {
+        const row = document.createElement('div');
+        Object.assign(row.style, {
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: '8px',
+          background: '#18181b',
+          border: '1px solid #27272a',
+          padding: '5px 8px',
+          borderRadius: '6px',
+        });
+        const lbl = document.createElement('span');
+        lbl.textContent = `🚫 ${dirName}`;
+        lbl.style.color = '#67e8f9';
+        lbl.style.fontFamily = 'monospace';
+        lbl.style.fontSize = '12px';
+        const btnRem = mkSmallBtn('移除', 'transparent', '1px solid #52525b', '#fca5a5');
+        btnRem.style.padding = '2px 8px';
+        btnRem.style.fontSize = '11px';
+        btnRem.addEventListener('click', async () => {
+          try {
+            const res = await mcpJson('POST', '/bridge/ignored_dirs', {
+              action: 'remove',
+              dir: dirName,
+            });
+            renderIgnoredDirsPanel(res);
+          } catch (err) {
+            ignInfoMsg.textContent = '移除忽略目录失败: ' + String(err && err.message ? err.message : err);
+            ignInfoMsg.style.color = '#f87171';
+          }
+        });
+        row.appendChild(lbl);
+        row.appendChild(btnRem);
+        ignListEl.appendChild(row);
+      }
+    }
+    refreshOpenModalIgnoredFn = renderIgnoredDirsPanel;
+
     async function refreshPermissionsPanel() {
       if (!getToken()) {
         permStatusMsg.textContent = '请先在下方填写本机派发的 auth.token 后测试连接。';
         return;
       }
       try {
-        const [snap, rulesSnap, wsSnap, wlSnap, planResp, pubResp] = await Promise.all([
+        const [snap, rulesSnap, wsSnap, wlSnap, ignSnap, planResp, pubResp] = await Promise.all([
           mcpJson('GET', '/bridge/permissions'),
           mcpJson('GET', '/bridge/rules').catch(() => null),
           mcpJson('GET', '/bridge/workspaces').catch(() => null),
           mcpJson('GET', '/bridge/whitelist').catch(() => null),
+          mcpJson('GET', '/bridge/ignored_dirs').catch(() => null),
           mcpJson('POST', '/bridge/task_plan', {
             action: 'get',
             conversation_id: getConversationId(),
@@ -2270,6 +2591,9 @@
         }
         if (wlSnap) {
           renderWhitelistPanel(wlSnap);
+        }
+        if (ignSnap) {
+          renderIgnoredDirsPanel(ignSnap);
         }
         if (rulesSnap && rulesSnap.tab_rules && rulesSnap.tab_rules[TAB_ID]) {
           renderRulesInfo(rulesSnap.tab_rules[TAB_ID]);
@@ -2598,12 +2922,59 @@
       }
     });
 
+    btnPickIgnFolder.addEventListener('click', async () => {
+      btnPickIgnFolder.disabled = true;
+      btnPickIgnFolder.textContent = '请在系统弹窗选择文件夹...';
+      try {
+        const res = await mcpJson('POST', '/bridge/ignored_dirs', { action: 'pick_folder' });
+        if (res && !res.cancelled) {
+          renderIgnoredDirsPanel(res);
+          ignInfoMsg.textContent = `✅ 已将 ${(res.added || []).join(', ')} 永久写入 config.json 的 ignored_dirs。`;
+          ignInfoMsg.style.color = '#34d399';
+        }
+      } catch (err) {
+        ignInfoMsg.textContent = '弹窗加入忽略目录失败: ' + String(err && err.message ? err.message : err);
+        ignInfoMsg.style.color = '#f87171';
+      } finally {
+        btnPickIgnFolder.disabled = false;
+        btnPickIgnFolder.textContent = '📂 选目录加入忽略';
+      }
+    });
+
+    btnAddIgn.addEventListener('click', async () => {
+      try {
+        const raw = inpIgnDir.value.trim();
+        if (!raw) throw new Error('请输入目录名、通配符或目录路径');
+        const parts = raw.split(/[,\n，]+/).map((s) => s.trim()).filter(Boolean);
+        const res = await mcpJson('POST', '/bridge/ignored_dirs', {
+          action: 'add',
+          dirs: parts,
+        });
+        inpIgnDir.value = '';
+        renderIgnoredDirsPanel(res);
+        ignInfoMsg.textContent = '✅ 已更新并永久保存 workspace.ignored_dirs（即时生效）。';
+        ignInfoMsg.style.color = '#34d399';
+      } catch (err) {
+        ignInfoMsg.textContent = '添加忽略目录失败: ' + String(err && err.message ? err.message : err);
+        ignInfoMsg.style.color = '#f87171';
+      }
+    });
+
+    const closeModal = () => {
+      refreshOpenModalIgnoredFn = null;
+      overlay.remove();
+    };
+    btnClose.onclick = null;
+    btnClose.addEventListener('click', closeModal);
+
     card.appendChild(h3);
     card.appendChild(info);
     card.appendChild(makeSectionTitle('当前窗口工作区目录（独立切换与规则同步）'));
     card.appendChild(wsBox);
     card.appendChild(makeSectionTitle('全局白名单目录（跨所有非禁止会话免授权自由读写）'));
     card.appendChild(wlBox);
+    card.appendChild(makeSectionTitle('忽略检索目录（list_dir / find_files / grep_search 自动跳过）'));
+    card.appendChild(ignBox);
     card.appendChild(makeSectionTitle('当前窗口权限档位（基于本会话链接）'));
     card.appendChild(permBox);
     card.appendChild(makeSectionTitle('已授权的会话链接清单'));
@@ -2617,7 +2988,7 @@
     card.appendChild(btnRow);
     overlay.appendChild(card);
     overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) overlay.remove();
+      if (e.target === overlay) closeModal();
     });
     document.body.appendChild(overlay);
     refreshPermissionsPanel();
